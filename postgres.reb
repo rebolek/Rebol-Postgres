@@ -126,7 +126,7 @@ make-cstring: func [
 	"Encode a Rebol string as a C-string (null-terminated)"
 	s [any-type!]
 ][
-	join form any [s ""] null
+	to binary! join form any [s ""] null
 ]
 
 make-parse-message: func [
@@ -134,15 +134,16 @@ make-parse-message: func [
 	stmt-name [any-type!]
 	query [string!]
 	param-oids [block! none!]
-	/local oids msg count
+	/local oids msg count cs-stmt cs-query
 ][
 	oids: any [param-oids copy []]
 	msg: make binary! (64 + length? query)
-	binary/write msg [
-		BYTES :make-cstring stmt-name
-		BYTES :make-cstring query
-		UI16  length? oids
-	]
+	cs-stmt: make-cstring stmt-name
+	cs-query: make-cstring query
+	append msg cs-stmt
+	append msg cs-query
+	count: length? oids
+	binary/write msg [UI16 :count]
 	foreach oid oids [
 		binary/write msg [UI32 to integer! oid]
 	]
@@ -165,14 +166,17 @@ make-bind-message: func [
 	portal-name [any-type!]
 	stmt-name [any-type!]
 	params [block!]
-	/local msg p enc
+	/local msg p enc cs-portal cs-stmt count
 ][
 	msg: make binary! 128
+	cs-portal: make-cstring portal-name
+	cs-stmt: make-cstring stmt-name
+	append msg cs-portal
+	append msg cs-stmt
+	count: length? params
 	binary/write msg [
-		BYTES :make-cstring portal-name
-		BYTES :make-cstring stmt-name
 		UI16  0                ; parameter format codes (0 = all text)
-		UI16  length? params   ; number of parameter values
+		UI16  :count           ; number of parameter values
 	]
 	foreach p params [
 		enc: encode-param-text p
@@ -193,12 +197,13 @@ make-describe-message: func [
 	"Build Describe message body"
 	kind [char!]
 	name [any-type!]
+	/local msg cs k
 ][
 	msg: make binary! 32
-	binary/write msg [
-		UI8   to integer! kind
-		BYTES :make-cstring name
-	]
+	cs: make-cstring name
+	k: to integer! kind
+	binary/write msg [UI8 :k]
+	append msg cs
 	msg
 ]
 
@@ -206,12 +211,13 @@ make-execute-message: func [
 	"Build Execute message body"
 	portal-name [any-type!]
 	max-rows [integer!]
+	/local msg cs mr
 ][
 	msg: make binary! 32
-	binary/write msg [
-		BYTES :make-cstring portal-name
-		UI32  max-rows
-	]
+	cs: make-cstring portal-name
+	append msg cs
+	mr: max-rows
+	binary/write msg [UI32 :mr]
 	msg
 ]
 
@@ -219,12 +225,13 @@ make-close-message: func [
 	"Build Close message body (S=statement, P=portal)"
 	kind [char!]
 	name [any-type!]
+	/local msg cs k
 ][
 	msg: make binary! 32
-	binary/write msg [
-		UI8   to integer! kind
-		BYTES :make-cstring name
-	]
+	cs: make-cstring name
+	k: to integer! kind
+	binary/write msg [UI8 :k]
+	append msg cs
 	msg
 ]
 
@@ -781,7 +788,7 @@ invoke-callback: func [
 build-result: func [
 	"Build a stable result map from current ctx state"
 	ctx [object!]
-	/local cols rt rows result
+	/local cols rt rows result tag row-count parts
 ][
 	cols: collect [
 		foreach col ctx/RowDescription [
@@ -798,10 +805,21 @@ build-result: func [
 	]
 	rt: make map! ctx/runtime
 	rows: shape-rows ctx
+	tag: either ctx/CommandComplete [clean-cstring any [ctx/CommandComplete ""]][none]
+	row-count: none
+	if all [tag string? tag not empty? tag] [
+		; Best-effort parse of rowcount from CommandComplete tag.
+		; Common forms: "SELECT 123", "UPDATE 7", "DELETE 4", "INSERT 0 9"
+		parts: split tag #" "
+		if all [2 <= length? parts integer? attempt [to integer! last parts]] [
+			row-count: to integer! last parts
+		]
+	]
 	result: compose #[
 		rows: (rows)
 		columns: (cols)
-		command-tag: (either ctx/CommandComplete [clean-cstring any [ctx/CommandComplete ""]][none])
+		command-tag: (tag)
+		row-count: (row-count)
 		notices: (ctx/notices)
 		runtime: (rt)
 		row-mode: (select ctx/options 'row-mode)
@@ -1038,6 +1056,7 @@ finish-inflight: function [
 		req/status: 'done
 		req/result: build-result ctx
 		invoke-callback req/on-done req/result
+		invoke-callback req/on-complete req/result
 	]
 
 	; Best-effort cleanup for chunked streaming: close cursor after completion.
@@ -1404,20 +1423,32 @@ sys/make-scheme [
 		write: func [
 			port [port!]
 			data [string! word! block!]
-			/local ctx req on-row on-done on-error blk req-data
+			/local ctx req on-row on-done on-complete on-error blk req-data max-rows arg6 arg7
 		][
 			unless open? port [
 				cause-error 'Access 'not-open port/spec/ref
 			]
 			ctx: port/extra
-			;-- Async streaming block form: [ASYNC-STREAM <data> :on-row :on-done :on-error]
+			;-- Async streaming block form:
+			;   [ASYNC-STREAM <data> :on-row :on-done :on-error]
+			;   [ASYNC-STREAM <data> :on-row :on-done :on-error max-rows]
+			;   [ASYNC-STREAM <data> :on-row :on-done :on-error :on-complete max-rows]
 			if all [block? data 'ASYNC-STREAM = first data] [
 				blk: data
 				req-data: second blk
 				on-row: any [third blk none]
 				on-done: any [fourth blk none]
 				on-error: any [fifth blk none]
-				max-rows: any [sixth blk 0]
+				on-complete: none
+				max-rows: 0
+				arg6: any [sixth blk none]
+				arg7: any [seventh blk none]
+				either integer? :arg6 [
+					max-rows: arg6
+				][
+					on-complete: arg6
+					if integer? :arg7 [max-rows: arg7]
+				]
 
 				ctx/next-req-id: ctx/next-req-id + 1
 				req: make object! [
@@ -1430,6 +1461,7 @@ sys/make-scheme [
 					cursor-id: none
 					on-row: none
 					on-done: none
+					on-complete: none
 					on-error: none
 					result: none
 					error: none
@@ -1439,6 +1471,7 @@ sys/make-scheme [
 				req/max-rows: to integer! max-rows
 				req/on-row: on-row
 				req/on-done: on-done
+				req/on-complete: on-complete
 				req/on-error: on-error
 				append ctx/request-queue req
 				start-next-request port
@@ -1461,6 +1494,7 @@ sys/make-scheme [
 					row-index: 0
 					on-row: none
 					on-done: none
+					on-complete: none
 					on-error: none
 					result: none
 					error: none
@@ -1469,6 +1503,7 @@ sys/make-scheme [
 				req/data: req-data
 				req/on-row: none
 				req/on-done: on-done
+				req/on-complete: none
 				req/on-error: on-error
 				append ctx/request-queue req
 				start-next-request port

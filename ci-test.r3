@@ -124,6 +124,23 @@ foreach [title code] [
 		]
 	]
 
+	"Async streaming on-complete hook (F2)" [
+		done: none
+		completed: none
+		cb-row: func [row][none]
+		cb-ok: func [res][done: 'ok]
+		cb-err: func [err][done: 'error]
+		cb-complete: func [res][completed: res/command-tag]
+		write pg [ASYNC-STREAM "SELECT 1 AS x" :cb-row :cb-ok :cb-err :cb-complete]
+		until [
+			wait [pg 10]
+			not none? done
+		]
+		if any [done <> 'ok none? completed] [
+			cause-error 'Access 'Protocol reduce ['message ajoin ["Async on-complete failed; done=" mold done " completed=" mold completed]]
+		]
+	]
+
 	"Creating test tables" [
 		write pg {
 BEGIN;

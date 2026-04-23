@@ -121,6 +121,9 @@ Notes:
 
 - Requests on a single connection are **processed sequentially** (Postgres protocol requires this). Async calls are queued and resolved in order.
 - Callbacks are invoked from the port’s IO/awake processing; keep handlers fast and non-blocking.
+- For chunked streaming (portal fetch), pass a final `max-rows` argument (e.g. `50`) to limit rows per fetch:
+  - `write pg [ASYNC-STREAM "SELECT ..." :on-row :on-done :on-error 50]`
+  - Optional end-of-stream hook: `write pg [ASYNC-STREAM "SELECT ..." :on-row :on-done :on-error :on-complete 50]`
 
 ## Examples and tests
 
