@@ -56,6 +56,27 @@ foreach [title code] [
 		]
 	]
 
+	"Async query (F1)" [
+		done: none
+		cb-ok: func [res][
+			; basic sanity: should be a map-like result with rows
+			done: any [all [map? res 'ok] 'ok]
+		]
+		cb-err: func [err][
+			print ["Async error:" mold err]
+			done: 'error
+		]
+		req: write pg [ASYNC "SELECT 1 AS x" :cb-ok :cb-err]
+		; wait until callback flips `done` (or timeout)
+		until [
+			wait [pg 5]
+			not none? done
+		]
+		if done <> 'ok [
+			cause-error 'Access 'Protocol reduce ['message ajoin ["Async test failed: " mold done]]
+		]
+	]
+
 	"Creating test tables" [
 		write pg {
 BEGIN;

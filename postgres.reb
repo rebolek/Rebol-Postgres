@@ -677,6 +677,274 @@ make-sslrequest: func [
 	req
 ]
 
+reset-result-state: func [
+	"Reset ctx fields used to accumulate a single request result"
+	ctx [object!]
+][
+	ctx/error: none
+	ctx/CommandComplete: none
+	ctx/last-error: none
+	ctx/last-result: none
+	ctx/PortalSuspended?: false
+	clear ctx/notices
+	clear ctx/Data
+	clear ctx/RowDescription
+	; runtime is connection-wide; don't clear it per request
+]
+
+invoke-callback: func [
+	"Invoke callback (supports func!, :fn, or 'fn)"
+	cb  [any-type!]
+	arg [any-type!]
+	/local fn
+][
+	if none? cb [return none]
+	fn: case [
+		function? :cb [:cb]
+		any [word? cb get-word? cb] [
+			; `get` retrieves the value without invoking it.
+			try [get cb]
+		]
+		'else [none]
+	]
+	if function? :fn [
+		try [fn :arg]
+	]
+]
+
+build-result: func [
+	"Build a stable result map from current ctx state"
+	ctx [object!]
+	/local cols rt rows result
+][
+	cols: collect [
+		foreach col ctx/RowDescription [
+			keep compose #[
+				name: (col/1)
+				table-oid: (col/2)
+				attr-number: (col/3)
+				type-oid: (col/4)
+				type-size: (col/5)
+				type-mod: (col/6)
+				format: (col/7)
+			]
+		]
+	]
+	rt: make map! ctx/runtime
+	rows: shape-rows ctx
+	result: compose #[
+		rows: (rows)
+		columns: (cols)
+		command-tag: (either ctx/CommandComplete [clean-cstring any [ctx/CommandComplete ""]][none])
+		notices: (ctx/notices)
+		runtime: (rt)
+		row-mode: (select ctx/options 'row-mode)
+		decode: (select ctx/options 'decode)
+		more?: (to logic! ctx/PortalSuspended?)
+	]
+	ctx/last-result: result
+	result
+]
+
+queue-command: function [
+	"Build packets for a write request into ctx/out-buffer"
+	ctx [object!]
+	data [string! word! block!]
+	/local stmt sql params param-oids cursor-id info portal-name stmt-name max-rows
+][
+	case [
+		string? data [
+			que-packet ctx #"Q" join data null
+		]
+		word? data [
+			switch data [
+				SYNC      [ que-packet ctx #"S" "" ]
+				TERMINATE [ que-packet ctx #"X" "Good bye!" ]
+			]
+		]
+		block? data [
+			switch/default first data [
+				PREPARE [
+					; [PREPARE name "SQL" [oids]]
+					stmt: second data
+					unless any [word? stmt string? stmt] [
+						ctx/error: #[message: "PREPARE expects statement name as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					unless string? third data [
+						ctx/error: #[message: "PREPARE expects SQL string as third item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					sql: third data
+					param-oids: any [fourth data none]
+					if all [param-oids not block? param-oids] [param-oids: to block! param-oids]
+					; cache client-side (for reconnect / introspection)
+					put ctx/prepared to word! form stmt reduce [sql param-oids]
+					; Parse + Sync
+					que-packet ctx #"P" make-parse-message stmt sql param-oids
+					que-packet ctx #"S" ""
+				]
+				DEALLOCATE [
+					; [DEALLOCATE name]
+					stmt: second data
+					unless any [word? stmt string? stmt] [
+						ctx/error: compose #[message: "DEALLOCATE expects statement name as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					remove/key ctx/prepared to word! form stmt
+					que-packet ctx #"C" make-close-message #"S" stmt
+					que-packet ctx #"S" ""
+				]
+				EXEC [
+					unless string? second data [
+						ctx/error: compose #[message: "EXEC expects SQL string as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					sql: second data
+					params: any [third data copy []]
+					unless block? params [params: to block! params]
+					;-- Minimal extended query flow using unnamed statement/portal:
+					;   Parse + Bind + Describe(portal) + Execute + Sync
+					que-packet ctx #"P" make-parse-message "" sql none
+					que-packet ctx #"B" make-bind-message "" "" params
+					que-packet ctx #"D" make-describe-message #"P" ""
+					que-packet ctx #"E" make-execute-message "" 0
+					que-packet ctx #"S" ""
+				]
+				EXECUTE [
+					; [EXECUTE name [params]]
+					stmt: second data
+					unless any [word? stmt string? stmt] [
+						ctx/error: compose #[message: "EXECUTE expects statement name as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					params: any [third data copy []]
+					unless block? params [params: to block! params]
+					que-packet ctx #"B" make-bind-message "" stmt params
+					que-packet ctx #"D" make-describe-message #"P" ""
+					que-packet ctx #"E" make-execute-message "" 0
+					que-packet ctx #"S" ""
+				]
+				CURSOR [
+					; [CURSOR id "SQL" [params] max-rows]
+					cursor-id: second data
+					unless any [word? cursor-id string? cursor-id] [
+						ctx/error: compose #[message: "CURSOR expects cursor id as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					unless string? third data [
+						ctx/error: compose #[message: "CURSOR expects SQL string as third item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					sql: third data
+					params: any [fourth data copy []]
+					unless block? params [params: to block! params]
+					max-rows: to integer! any [fifth data 100]
+					stmt-name: ajoin ["stmt-" form cursor-id]
+					portal-name: ajoin ["cur-" form cursor-id]
+					put ctx/cursors to word! form cursor-id reduce [stmt-name portal-name max-rows]
+					; Parse (named) + Bind (named portal) + Describe (portal) + Execute(max) + Sync
+					que-packet ctx #"P" make-parse-message stmt-name sql none
+					que-packet ctx #"B" make-bind-message portal-name stmt-name params
+					que-packet ctx #"D" make-describe-message #"P" portal-name
+					que-packet ctx #"E" make-execute-message portal-name max-rows
+					que-packet ctx #"S" ""
+				]
+				FETCH [
+					; [FETCH id]
+					cursor-id: second data
+					unless any [word? cursor-id string? cursor-id] [
+						ctx/error: compose #[message: "FETCH expects cursor id as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					info: select ctx/cursors to word! form cursor-id
+					unless info [
+						ctx/error: compose #[message: (ajoin ["Unknown cursor id: " form cursor-id])]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					portal-name: info/2
+					max-rows: info/3
+					que-packet ctx #"E" make-execute-message portal-name max-rows
+					que-packet ctx #"S" ""
+				]
+				CLOSE-CURSOR [
+					; [CLOSE-CURSOR id]
+					cursor-id: second data
+					unless any [word? cursor-id string? cursor-id] [
+						ctx/error: compose #[message: "CLOSE-CURSOR expects cursor id as second item"]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					info: select ctx/cursors to word! form cursor-id
+					unless info [
+						ctx/error: compose #[message: (ajoin ["Unknown cursor id: " form cursor-id])]
+						cause-error 'Access 'Protocol ctx/error
+					]
+					portal-name: info/2
+					stmt-name: info/1
+					remove/key ctx/cursors to word! form cursor-id
+					que-packet ctx #"C" make-close-message #"P" portal-name
+					que-packet ctx #"C" make-close-message #"S" stmt-name
+					que-packet ctx #"S" ""
+				]
+			][
+				ctx/error: compose #[
+					message: (ajoin ["Unsupported write block form: " mold data])
+				]
+				cause-error 'Access 'Protocol ctx/error
+			]
+		]
+	]
+]
+
+start-next-request: function [
+	"Start queued async request if idle"
+	pg [port!]
+][
+	ctx: pg/extra
+	if ctx/inflight [return none]
+	if empty? ctx/request-queue [return none]
+
+	req: take ctx/request-queue
+	ctx/inflight: req
+	reset-result-state ctx
+	queue-command ctx req/data
+
+	; kick IO if connection is already ready
+	if all [
+		ctx/ReadyForQuery
+		pg/state = 'READY
+	][
+		pg/state: 'WRITE
+		write ctx/connection take/part ctx/out-buffer 32000
+	]
+	req
+]
+
+finish-inflight: function [
+	"Finalize inflight request and run callbacks"
+	pg [port!]
+][
+	ctx: pg/extra
+	req: ctx/inflight
+	unless req [return none]
+
+	; build either result or error and invoke callbacks
+	either ctx/error [
+		req/status: 'error
+		req/error: ctx/error
+		ctx/last-error: ctx/error
+		invoke-callback req/on-error ctx/error
+	][
+		req/status: 'done
+		req/result: build-result ctx
+		invoke-callback req/on-done req/result
+	]
+
+	ctx/inflight: none
+	reset-result-state ctx
+	start-next-request pg
+]
+
 pg-conn-awake: function [event][
 	conn:  event/port  ;; TCP or TLS port used for IO
 	pg:    conn/parent ;; Higher level postgres port
@@ -811,6 +1079,16 @@ pg-conn-awake: function [event][
 					pg/state: 'READY
 				]
 			]
+
+			;-- If an async request is inflight, complete it when server is ready.
+			;   (ReadyForQuery may also appear during handshake; inflight guards that.)
+			if all [
+				pg/state = 'READY
+				ctx/ReadyForQuery
+				ctx/inflight
+			][
+				finish-inflight pg
+			]
 			
 			true
 		]
@@ -904,12 +1182,14 @@ sys/make-scheme [
 				error: none
 				last-error: none
 				last-result: none
+				request-queue: make block! 10
+				inflight: none
+				next-req-id: 0
 				runtime: make block! 30
 				notices: make block! 10
 				out-buffer: make binary! 1000
 				inp-buffer: make binary! 1000
 				authenticated?: false
-				async?: false
 				CancelKeyData:
 				ReadyForQuery: none
 				RowDescription: make block! 20
@@ -1005,162 +1285,40 @@ sys/make-scheme [
 		write: func [
 			port [port!]
 			data [string! word! block!]
-			/local ctx cols result rt rows stmt sql params
+			/local ctx req on-done on-error blk req-data
 		][
 			unless open? port [
 				cause-error 'Access 'not-open port/spec/ref
 			]
 			ctx: port/extra
-			ctx/error: none
-			ctx/CommandComplete: none
-			ctx/last-error: none
-			ctx/last-result: none
-			ctx/PortalSuspended?: false
-			clear ctx/notices
-			clear ctx/Data
-			clear ctx/RowDescription
-			case [
-				string? data [
-					que-packet ctx #"Q" join data null
+			;-- Async block form: [ASYNC <data> :on-done :on-error]
+			if all [block? data 'ASYNC = first data] [
+				blk: data
+				req-data: second blk
+				on-done: any [third blk none]
+				on-error: any [fourth blk none]
+
+				ctx/next-req-id: ctx/next-req-id + 1
+				req: make object! [
+					id: none
+					status: 'pending
+					data: none
+					on-done: none
+					on-error: none
+					result: none
+					error: none
 				]
-				word? data [
-					switch data [
-						SYNC      [ que-packet ctx #"S" "" ]
-						TERMINATE [ que-packet ctx #"X" "Good bye!" ]
-					]
-				]
-				block? data [
-					switch/default first data [
-						PREPARE [
-							; [PREPARE name "SQL" [oids]]
-							stmt: second data
-							unless any [word? stmt string? stmt] [
-								ctx/error: #[message: "PREPARE expects statement name as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							unless string? third data [
-								ctx/error: #[message: "PREPARE expects SQL string as third item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							sql: third data
-							param-oids: any [fourth data none]
-							if all [param-oids not block? param-oids] [param-oids: to block! param-oids]
-							; cache client-side (for reconnect / introspection)
-							put ctx/prepared to word! form stmt reduce [sql param-oids]
-							; Parse + Sync
-							que-packet ctx #"P" make-parse-message stmt sql param-oids
-							que-packet ctx #"S" ""
-						]
-						DEALLOCATE [
-							; [DEALLOCATE name]
-							stmt: second data
-							unless any [word? stmt string? stmt] [
-								ctx/error: compose #[message: "DEALLOCATE expects statement name as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							remove/key ctx/prepared to word! form stmt
-							que-packet ctx #"C" make-close-message #"S" stmt
-							que-packet ctx #"S" ""
-						]
-						EXEC [
-							unless string? second data [
-								ctx/error: compose #[message: "EXEC expects SQL string as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							sql: second data
-							params: any [third data copy []]
-							unless block? params [params: to block! params]
-							;-- Minimal extended query flow using unnamed statement/portal:
-							;   Parse + Bind + Describe(portal) + Execute + Sync
-							que-packet ctx #"P" make-parse-message "" sql none
-							que-packet ctx #"B" make-bind-message "" "" params
-							que-packet ctx #"D" make-describe-message #"P" ""
-							que-packet ctx #"E" make-execute-message "" 0
-							que-packet ctx #"S" ""
-						]
-						EXECUTE [
-							; [EXECUTE name [params]]
-							stmt: second data
-							unless any [word? stmt string? stmt] [
-								ctx/error: compose #[message: "EXECUTE expects statement name as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							params: any [third data copy []]
-							unless block? params [params: to block! params]
-							que-packet ctx #"B" make-bind-message "" stmt params
-							que-packet ctx #"D" make-describe-message #"P" ""
-							que-packet ctx #"E" make-execute-message "" 0
-							que-packet ctx #"S" ""
-						]
-						CURSOR [
-							; [CURSOR id "SQL" [params] max-rows]
-							cursor-id: second data
-							unless any [word? cursor-id string? cursor-id] [
-								ctx/error: compose #[message: "CURSOR expects cursor id as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							unless string? third data [
-								ctx/error: compose #[message: "CURSOR expects SQL string as third item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							sql: third data
-							params: any [fourth data copy []]
-							unless block? params [params: to block! params]
-							max-rows: to integer! any [fifth data 100]
-							stmt-name: ajoin ["stmt-" form cursor-id]
-							portal-name: ajoin ["cur-" form cursor-id]
-							put ctx/cursors to word! form cursor-id reduce [stmt-name portal-name max-rows]
-							; Parse (named) + Bind (named portal) + Describe (portal) + Execute(max) + Sync
-							que-packet ctx #"P" make-parse-message stmt-name sql none
-							que-packet ctx #"B" make-bind-message portal-name stmt-name params
-							que-packet ctx #"D" make-describe-message #"P" portal-name
-							que-packet ctx #"E" make-execute-message portal-name max-rows
-							que-packet ctx #"S" ""
-						]
-						FETCH [
-							; [FETCH id]
-							cursor-id: second data
-							unless any [word? cursor-id string? cursor-id] [
-								ctx/error: compose #[message: "FETCH expects cursor id as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							info: select ctx/cursors to word! form cursor-id
-							unless info [
-								ctx/error: compose #[message: (ajoin ["Unknown cursor id: " form cursor-id])]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							portal-name: info/2
-							max-rows: info/3
-							que-packet ctx #"E" make-execute-message portal-name max-rows
-							que-packet ctx #"S" ""
-						]
-						CLOSE-CURSOR [
-							; [CLOSE-CURSOR id]
-							cursor-id: second data
-							unless any [word? cursor-id string? cursor-id] [
-								ctx/error: compose #[message: "CLOSE-CURSOR expects cursor id as second item"]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							info: select ctx/cursors to word! form cursor-id
-							unless info [
-								ctx/error: compose #[message: (ajoin ["Unknown cursor id: " form cursor-id])]
-								cause-error 'Access 'Protocol ctx/error
-							]
-							portal-name: info/2
-							stmt-name: info/1
-							remove/key ctx/cursors to word! form cursor-id
-							que-packet ctx #"C" make-close-message #"P" portal-name
-							que-packet ctx #"C" make-close-message #"S" stmt-name
-							que-packet ctx #"S" ""
-						]
-					][
-						ctx/error: compose #[
-							message: (ajoin ["Unsupported write block form: " mold data])
-						]
-						cause-error 'Access 'Protocol ctx/error
-					]
-				]
+				req/id: ctx/next-req-id
+				req/data: req-data
+				req/on-done: on-done
+				req/on-error: on-error
+				append ctx/request-queue req
+				start-next-request port
+				return req
 			]
+
+			reset-result-state ctx
+			queue-command ctx data
 
 			if all [
 				ctx/ReadyForQuery
@@ -1169,84 +1327,38 @@ sys/make-scheme [
 				port/state: 'WRITE
 				write ctx/connection take/part ctx/out-buffer 32000
 			]
-			unless ctx/async? [
-				unless wait [port port/spec/timeout][
-					;; wait returns none in case of timeout...
-					cause-error 'Access 'Timeout port/spec/ref
+			unless wait [port port/spec/timeout][
+				;; wait returns none in case of timeout...
+				cause-error 'Access 'Timeout port/spec/ref
+			]
+			;@@ TODO: improve!
+			return case [
+				ctx/error [
+					port/state: 'READY
+					ctx/last-error: ctx/error
+					cause-error 'Access 'Protocol ctx/error
 				]
-				;@@ TODO: improve!
-				return case [
-					ctx/error [
-						port/state: 'READY
-						ctx/last-error: ctx/error
-						cause-error 'Access 'Protocol ctx/error
-					]
-					ctx/PortalSuspended? [
-						cols: collect [
-							foreach col ctx/RowDescription [
-								keep compose #[
-									name: (col/1)
-									table-oid: (col/2)
-									attr-number: (col/3)
-									type-oid: (col/4)
-									type-size: (col/5)
-									type-mod: (col/6)
-									format: (col/7)
-								]
-							]
-						]
-						rt: make map! ctx/runtime
-						rows: shape-rows ctx
-						result: compose #[
-							rows: (rows)
-							columns: (cols)
-							command-tag: (none)
-							notices: (ctx/notices)
-							runtime: (rt)
-							row-mode: (select ctx/options 'row-mode)
-							decode: (select ctx/options 'decode)
-							more?: (true)
-						]
-						ctx/last-result: result
-						result
-					]
-					ctx/CommandComplete [
-						cols: collect [
-							foreach col ctx/RowDescription [
-								keep compose #[
-									name: (col/1)
-									table-oid: (col/2)
-									attr-number: (col/3)
-									type-oid: (col/4)
-									type-size: (col/5)
-									type-mod: (col/6)
-									format: (col/7)
-								]
-							]
-						]
-						rt: make map! ctx/runtime
-						rows: shape-rows ctx
-						result: #[
-							rows: (rows)
-							columns: (cols)
-							command-tag: (clean-cstring any [ctx/CommandComplete ""])
-							notices: (ctx/notices)
-							runtime: (rt)
-							row-mode: (select ctx/options 'row-mode)
-							decode: (select ctx/options 'decode)
-							more?: (false)
-						]
-						ctx/last-result: result
-						result
-					]
+				ctx/PortalSuspended? [
+					; partial result (cursor/chunked)
+					build-result ctx
+				]
+				ctx/CommandComplete [
+					build-result ctx
 				]
 			]
 		]
 		
 		read: func [
 			port [port!]
+			/local ctx
 		][
-			;@@TODO: review this...
+			unless open? port [
+				cause-error 'Access 'not-open port/spec/ref
+			]
+			ctx: port/extra
+			; Kick a read on the underlying TCP/TLS connection; parsing happens in awake.
+			read ctx/connection
+			port
 		]
 	]
 ]
