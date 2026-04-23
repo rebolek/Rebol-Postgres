@@ -301,7 +301,7 @@ process-responses: function[
 					sys/log/more 'POSTGRES ["Column data:^[[m" ellipsize copy/part tmp 80 75]
 					append row tmp
 				]
-				append ctx/data row
+				append/only ctx/data row
 			]
 			#"C" [
 				;; Identifies the message as a command-completed response.
@@ -415,6 +415,114 @@ parse-auth-list: func [
 		if not empty? item [append out to word! item]
 	]
 	out
+]
+
+parse-row-mode: func [
+	"Parse row option into one of: flat/block/map"
+	s [any-type!]
+	/local val
+][
+	val: lowercase trim form any [s ""]
+	switch/default val [
+		""      ['flat]
+		"flat"  ['flat]
+		"block" ['block]
+		"map"   ['map]
+	]['flat]
+]
+
+parse-decode-mode: func [
+	"Parse decode option into one of: off/basic"
+	s [any-type!]
+	/local val
+][
+	val: lowercase trim form any [s ""]
+	switch/default val [
+		""      ['off]
+		"off"   ['off]
+		"basic" ['basic]
+	]['off]
+]
+
+decode-basic-value: func [
+	"Convert a text-format field value based on type OID"
+	oid [integer!]
+	val [any-type!]
+	/local tmp
+][
+	if none? val [return none]
+	if not string? val [val: form val]
+	val: trim val
+	switch/default oid [
+		16 [ ; bool
+			val: lowercase val
+			any [
+				val = "t"
+				val = "true"
+				val = "1"
+			]
+		]
+		20 21 23 [ ; int8/int2/int4
+			any [attempt [to integer! val] val]
+		]
+		700 701 1700 [ ; float4/float8/numeric
+			any [attempt [to decimal! val] val]
+		]
+		1082 [ ; date
+			any [attempt [to date! val] val]
+		]
+	][
+		val
+	]
+]
+
+shape-rows: func [
+	"Shape + optionally decode collected rows"
+	ctx [object!]
+	/local mode decode cols rows-out names row out-row i col oid row-map n
+][
+	mode: any [all [ctx/options select ctx/options 'row-mode] 'flat]
+	decode: any [all [ctx/options select ctx/options 'decode] 'off]
+	cols: ctx/RowDescription
+
+	; Build a list of column names (aligned with row values).
+	names: collect [
+		foreach col cols [keep col/1]
+	]
+
+	rows-out: make block! length? ctx/Data
+	foreach row ctx/Data [
+		out-row: row
+		if decode = 'basic [
+			out-row: copy row
+			i: 0
+			foreach v out-row [
+				++ i
+				col: pick cols i
+				oid: any [all [col integer? col/4 col/4] 0]
+				change at out-row i decode-basic-value oid v
+			]
+		]
+		switch mode [
+			block [
+				append/only rows-out out-row
+			]
+			map [
+				row-map: make map! (2 * length? names)
+				i: 0
+				foreach n names [
+					++ i
+					put row-map to word! n pick out-row i
+				]
+				append/only rows-out row-map
+			]
+			flat [
+				; Legacy output: flatten all values into one block.
+				append rows-out out-row
+			]
+		]
+	]
+	rows-out
 ]
 
 parse-sslmode: func [
@@ -642,7 +750,7 @@ sys/make-scheme [
 	actor: [
 		open: func [
 			port [port!]
-			/local conn spec user database db params allowed-auth sslmode
+			/local conn spec user database db params allowed-auth sslmode row-mode decode-mode
 		] [
 			if port/extra [return port]
 
@@ -711,11 +819,15 @@ sys/make-scheme [
 				[ scram md5 cleartext ]
 			]
 			sslmode: parse-sslmode select params 'sslmode
+			row-mode: parse-row-mode select params 'row
+			decode-mode: parse-decode-mode select params 'decode
 			port/extra/options: make map! reduce [
 				'auth allowed-auth
 				'allow-cleartext? not none? find allowed-auth 'cleartext
 				'sslmode sslmode
 				'ssl-state none
+				'row-mode row-mode
+				'decode decode-mode
 			]
 			database: any [select params 'database database]
 			port/extra/database: database
@@ -822,12 +934,15 @@ sys/make-scheme [
 							]
 						]
 						rt: make map! ctx/runtime
+						rows: shape-rows ctx
 						result: make map! reduce [
-							'rows ctx/Data
+							'rows rows
 							'columns cols
 							'command-tag clean-cstring any [ctx/CommandComplete ""]
 							'notices ctx/notices
 							'runtime rt
+							'row-mode select ctx/options 'row-mode
+							'decode select ctx/options 'decode
 						]
 						ctx/last-result: result
 						result

@@ -34,6 +34,8 @@ You can pass a small set of options using URL query params:
 
 - `database=<name>`: overrides the database from the URL path
 - `auth=<list>`: comma-separated list of allowed authentication methods: `scram,md5,cleartext`
+- `row=<mode>`: result row shaping: `flat` (default), `block`, `map`
+- `decode=<mode>`: type decoding: `off` (default), `basic` (text format only)
 - `sslmode=<mode>`: `disable` (default), `prefer`, `require`
   - `prefer` will try TLS and fall back to plaintext if the server refuses SSL.
   - `require` will error if the server refuses SSL.
@@ -49,6 +51,9 @@ pg: open postgres://postgres:password@localhost?database=postgres
 
 ; allow only SCRAM (disable MD5 + cleartext)
 pg: open postgres://postgres:password@localhost/postgres?auth=scram
+
+; return rows as maps and decode basic scalar types
+pg: open postgres://postgres:password@localhost/postgres?row=map&decode=basic
 
 ; require TLS (fails if server refuses SSL/TLS)
 pg: open postgres://postgres:password@localhost/postgres?sslmode=require

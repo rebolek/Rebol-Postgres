@@ -33,6 +33,10 @@ foreach [title code] [
 		write pg "SELECT datname FROM pg_database WHERE datistemplate = false;"
 	]
 
+	"Decode demo (enable via PG_URL query params)" [
+		write pg "SELECT 1::int4 AS i, 2::int8 AS b, true::bool AS t, 1.5::float8 AS f, '2023-10-26'::date AS d;"
+	]
+
 	"Creating test tables" [
 		write pg {
 BEGIN;
