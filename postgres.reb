@@ -58,7 +58,7 @@ scram: func [
 ]
 
 authenticate: funct [ctx] [
-	;@@ TODO: use authentication aaccording server's preferences!!!
+	; Select a supported mechanism from server-offered preferences (handled in AuthenticationSASL).
 	nonce: make binary! 24
 	binary/write nonce [random-bytes 24]
 	ctx/sasl/client-first-message-bare: ajoin [
@@ -266,7 +266,6 @@ process-responses: function[
 	append ctx/inp-buffer take/all ctx/connection/data
 	sys/log/debug 'POSTGRES ["Process input length:" length? ctx/inp-buffer]
 	bin: binary head ctx/inp-buffer
-	;? ctx
 	while [5 <= length? bin/buffer][
 		binary/read bin [
 			type: UI8
@@ -274,13 +273,10 @@ process-responses: function[
 		]
 		body-len: len - 4
 		body-start: length? bin/buffer
-		;sys/log/debug 'POSTGRES ["Process responses length:" len "buff:" length? bin/buffer]
 		if body-len > length? bin/buffer [
-			print "not complete!"
 			break
 		]
 		type: to char! type
-		;? type
 		switch/default/case type [
 			#"R" [
 				auth-id: binary/read bin 'UI32
@@ -401,7 +397,6 @@ process-responses: function[
 			]
 			#"D" [
 				;; Identifies the message as a data row.
-				;@@ TODO: keep this info for later use!!!
 				cols: binary/read bin 'UI16
 				row: clear []
 				loop cols [
@@ -428,7 +423,6 @@ process-responses: function[
 			]
 			#"C" [
 				;; Identifies the message as a command-completed response.
-				;@@ TODO: process the result!!!
 				ctx/CommandComplete: tmp: to string! binary/read bin len - 4
 				sys/log/more 'POSTGRES ["Command completed:^[[m" tmp]
 			]
@@ -1286,8 +1280,6 @@ pg-conn-awake: function [event][
 			]
 
 			process-responses ctx
-			;? ctx/out-buffer
-			;? ctx/inp-buffer
 			case [
 				all [
 					ctx/error
@@ -1392,7 +1384,6 @@ sys/make-scheme [
 			if port/extra [return port]
 
 			spec: port/spec
-			;? spec
 
 			user: any [select spec 'user "postgres"]
 			database: any [
