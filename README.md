@@ -28,6 +28,20 @@ print res/command-tag
 close pg
 ```
 
+### Error handling
+
+On protocol/query errors `write` raises an error whose argument is a `map!` of server error fields
+(including `sql-state`, `message`, `detail`, `hint`, etc. when present). The same map is also
+available on the port as `pg/extra/last-error`.
+
+```rebol
+err: try [write pg {SELECT * FROM nonexistingtable;}]
+if error? :err [
+    probe err/arg1           ; map! with sql-state, message, ...
+    probe pg/extra/last-error
+]
+```
+
 ### `write` result
 
 `write` returns a `map!` with these keys:

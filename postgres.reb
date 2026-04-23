@@ -144,8 +144,10 @@ process-responses: function[
 			type: UI8
 			len:  UI32
 		]
+		body-len: len - 4
+		body-start: length? bin/buffer
 		;sys/log/debug 'POSTGRES ["Process responses length:" len "buff:" length? bin/buffer]
-		if (len - 4) > length? bin/buffer [
+		if body-len > length? bin/buffer [
 			print "not complete!"
 			break
 		]
@@ -287,9 +289,25 @@ process-responses: function[
 			]
 		][
 			sys/log/error 'POSTGRES ["Unknown message type:" type]
-			binary/read bin len - 4
+			binary/read bin body-len
 		]
-		;@@ TODO: validate that correct length of data was consumed!
+
+		;-- Validate that handler consumed exactly declared message body length.
+		consumed: body-start - length? bin/buffer
+		case [
+			consumed < body-len [
+				; Handler did not consume all bytes; skip remainder.
+				binary/read bin body-len - consumed
+			]
+			consumed > body-len [
+				; Handler over-consumed (stream is now out-of-sync). Stop and surface error.
+				ctx/error: make map! reduce [
+					'message ajoin ["Protocol desync (consumed " consumed " bytes, expected " body-len ")"]
+				]
+				sys/log/error 'POSTGRES select ctx/error 'message
+				break
+			]
+		]
 	]
 	;; Remove all processed data from the head of the input buffer
 	truncate bin/buffer
@@ -446,6 +464,8 @@ sys/make-scheme [
 				awake: :port/awake
 				state: none
 				error: none
+				last-error: none
+				last-result: none
 				runtime: make block! 30
 				notices: make block! 10
 				out-buffer: make binary! 1000
@@ -534,6 +554,8 @@ sys/make-scheme [
 			ctx: port/extra
 			ctx/error: none
 			ctx/CommandComplete: none
+			ctx/last-error: none
+			ctx/last-result: none
 			clear ctx/notices
 			clear ctx/Data
 			clear ctx/RowDescription
@@ -565,6 +587,7 @@ sys/make-scheme [
 				return case [
 					ctx/error [
 						port/state: 'READY
+						ctx/last-error: ctx/error
 						cause-error 'Access 'Protocol ctx/error
 					]
 					ctx/CommandComplete [
@@ -589,6 +612,7 @@ sys/make-scheme [
 							'notices ctx/notices
 							'runtime rt
 						]
+						ctx/last-result: result
 						result
 					]
 				]
