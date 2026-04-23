@@ -34,6 +34,12 @@ You can pass a small set of options using URL query params:
 
 - `database=<name>`: overrides the database from the URL path
 - `auth=<list>`: comma-separated list of allowed authentication methods: `scram,md5,cleartext`
+- `sslmode=<mode>`: `disable` (default), `prefer`, `require`
+  - `prefer` will try TLS and fall back to plaintext if the server refuses SSL.
+  - `require` will error if the server refuses SSL.
+  - `prefer` is vulnerable to downgrade (an active attacker can block SSLRequest); use `require` on untrusted networks.
+  - Cleartext authentication over plaintext is insecure; use `sslmode=require` if you enable `auth=cleartext`.
+  - Certificate verification knobs are not exposed by this scheme yet; treat TLS as encryption-in-transit, not identity verification.
 
 Examples:
 
@@ -43,6 +49,12 @@ pg: open postgres://postgres:password@localhost?database=postgres
 
 ; allow only SCRAM (disable MD5 + cleartext)
 pg: open postgres://postgres:password@localhost/postgres?auth=scram
+
+; require TLS (fails if server refuses SSL/TLS)
+pg: open postgres://postgres:password@localhost/postgres?sslmode=require
+
+; prefer TLS (use TLS if available, otherwise plaintext)
+pg: open postgres://postgres:password@localhost/postgres?sslmode=prefer
 ```
 
 ### Error handling

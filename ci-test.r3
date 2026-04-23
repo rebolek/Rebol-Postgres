@@ -15,9 +15,11 @@ pgsql: import %postgres.reb
 
 system/options/log/postgres: 3
 
+pg-url: any [get-env "PG_URL" "postgres://postgres:password@localhost"]
+
 foreach [title code] [
 	"Opening a connection" [
-		pg: open postgres://postgres:password@localhost
+		pg: open as url! pg-url
 	]
 
 	"Simple query (get PostgreSQL version)" [

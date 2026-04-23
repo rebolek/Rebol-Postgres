@@ -36,3 +36,36 @@ jobs:
 
     - name: Test Rebol/Postgres protocol
       run: ./rebol3 ci-test.r3
+
+  linux-tls:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install Rebol
+      uses: oldes/install-rebol@v3.18.0
+
+    - name: Build TLS-enabled Postgres image
+      run: docker build -t postgres-tls -f .github/ci/postgres-tls.Dockerfile .
+
+    - name: Start TLS-enabled Postgres
+      run: |
+        docker run -d --name postgres-tls \
+          -p 5433:5432 \
+          -e POSTGRES_USER=postgres \
+          -e POSTGRES_PASSWORD=password \
+          -e POSTGRES_DB=postgres \
+          postgres-tls
+        for i in {1..30}; do
+          docker exec postgres-tls pg_isready -U postgres && exit 0
+          sleep 1
+        done
+        echo "Postgres TLS did not become ready" >&2
+        docker logs postgres-tls
+        exit 1
+
+    - name: Test Rebol/Postgres protocol over TLS
+      env:
+        PG_URL: postgres://postgres:password@localhost:5433/postgres?sslmode=require
+      run: ./rebol3 ci-test.r3

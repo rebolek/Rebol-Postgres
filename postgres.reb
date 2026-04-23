@@ -417,9 +417,34 @@ parse-auth-list: func [
 	out
 ]
 
+parse-sslmode: func [
+	"Parse sslmode option into one of: disable/prefer/require"
+	s [any-type!]
+	/local val
+][
+	val: lowercase trim form any [s ""]
+	switch/default val [
+		""       ['disable]
+		"disable" ['disable]
+		"prefer"  ['prefer]
+		"require" ['require]
+	]['disable]
+]
+
+make-sslrequest: func [
+	"Build SSLRequest packet (len=8, code=80877103)"
+][
+	req: make binary! 8
+	binary/write req [
+		UI32 8
+		UI32 80877103
+	]
+	req
+]
+
 pg-conn-awake: function [event][
-	conn:  event/port  ;; The real TCP connection
-	pg:    conn/parent ;; Higher level postgress port
+	conn:  event/port  ;; TCP or TLS port used for IO
+	pg:    conn/parent ;; Higher level postgres port
 	ctx:   pg/extra    ;; Context
 	sys/log/debug 'POSTGRES ["State:" pg/state "event:" event/type "ref:" event/port/spec/ref]
 
@@ -435,6 +460,22 @@ pg-conn-awake: function [event][
 			false
 		]
 		connect [
+			;-- If TCP connect and SSL is enabled, negotiate SSLRequest first.
+			if all [
+				ctx/options
+				select ctx/options 'sslmode <> 'disable
+				none? select ctx/options 'ssl-state
+				'tcp = either word? conn/scheme [conn/scheme][conn/scheme/name]
+			][
+				sys/log/more 'POSTGRES ["Sending SSLRequest (sslmode=" select ctx/options 'sslmode ")..."]
+				put ctx/options 'ssl-state 'sslrequest
+				pg/state: 'SSLREQUEST
+				write conn make-sslrequest
+				read conn
+				return false
+			]
+
+			;-- TLS handshake finished OR plaintext connect: send StartupMessage.
 			sys/log/more 'POSTGRES "Sending startup..."
 			pg/state: 'WRITE
 			write conn make-startup-message ctx/user ctx/database
@@ -442,6 +483,73 @@ pg-conn-awake: function [event][
 		]
 
 		read [
+			;-- Handle 1-byte SSLRequest response before protocol parsing.
+			if all [
+				ctx/options
+				select ctx/options 'ssl-state = 'sslrequest
+				'tcp = either word? conn/scheme [conn/scheme][conn/scheme/name]
+			][
+				data: take/all conn/data
+				if empty? data [
+					read conn
+					return false
+				]
+				reply: to char! data/1
+				switch/default reply [
+					#"S" [
+						sys/log/more 'POSTGRES "Server accepted SSLRequest. Starting TLS..."
+						put ctx/options 'ssl-state 'tls
+						pg/state: 'TLS
+						;-- Wrap existing TCP connection with TLS scheme.
+						tls: make port! [
+							scheme: 'tls
+							conn: conn
+							host: conn/spec/host
+							port: conn/spec/port
+							ref:  rejoin [tls:// host #":" port]
+						]
+						tls/parent: pg
+						tls/awake: :pg-conn-awake
+						ctx/connection: tls
+						res: try [open tls]
+						if error? :res [
+							ctx/error: make map! reduce [
+								'message "TLS negotiation failed (TLS scheme unavailable or handshake error)"
+								'detail mold res
+							]
+							sys/log/error 'POSTGRES select ctx/error 'message
+							close conn
+							return true
+						]
+						return false
+					]
+					#"N" [
+						sys/log/more 'POSTGRES "Server refused SSLRequest."
+						put ctx/options 'ssl-state 'plaintext
+						if select ctx/options 'sslmode = 'require [
+							ctx/error: make map! reduce [
+								'message "Server does not support TLS (SSLRequest refused) and sslmode=require"
+							]
+							sys/log/error 'POSTGRES select ctx/error 'message
+							close conn
+							return true
+						]
+						;-- Continue plaintext by sending StartupMessage.
+						sys/log/more 'POSTGRES "Continuing in plaintext (sslmode=prefer)."
+						pg/state: 'WRITE
+						write conn make-startup-message ctx/user ctx/database
+						return false
+					]
+				][
+					ctx/error: make map! reduce [
+						'message ajoin ["Unexpected SSLRequest response byte: " mold reply]
+					]
+					sys/log/error 'POSTGRES select ctx/error 'message
+					close conn
+					return true
+				]
+			]
+
 			process-responses ctx
 			;? ctx/out-buffer
 			;? ctx/inp-buffer
@@ -534,7 +642,7 @@ sys/make-scheme [
 	actor: [
 		open: func [
 			port [port!]
-			/local conn spec user database db params allowed-auth
+			/local conn spec user database db params allowed-auth sslmode
 		] [
 			if port/extra [return port]
 
@@ -602,9 +710,12 @@ sys/make-scheme [
 				all [select params 'auth parse-auth-list select params 'auth]
 				[ scram md5 cleartext ]
 			]
+			sslmode: parse-sslmode select params 'sslmode
 			port/extra/options: make map! reduce [
 				'auth allowed-auth
 				'allow-cleartext? not none? find allowed-auth 'cleartext
+				'sslmode sslmode
+				'ssl-state none
 			]
 			database: any [select params 'database database]
 			port/extra/database: database
