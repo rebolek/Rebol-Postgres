@@ -137,15 +137,15 @@ make-parse-message: func [
 	/local oids msg count cs-stmt cs-query
 ][
 	oids: any [param-oids copy []]
-	msg: make binary! (64 + length? query)
+	msg: clear make binary! (64 + length? query)
 	cs-stmt: make-cstring stmt-name
 	cs-query: make-cstring query
 	append msg cs-stmt
 	append msg cs-query
 	count: length? oids
-	binary/write msg [UI16 :count]
+	binary/write tail msg [UI16 :count]
 	foreach oid oids [
-		binary/write msg [UI32 to integer! oid]
+		binary/write tail msg [UI32 to integer! oid]
 	]
 	msg
 ]
@@ -168,26 +168,26 @@ make-bind-message: func [
 	params [block!]
 	/local msg p enc cs-portal cs-stmt count
 ][
-	msg: make binary! 128
+	msg: clear make binary! 128
 	cs-portal: make-cstring portal-name
 	cs-stmt: make-cstring stmt-name
 	append msg cs-portal
 	append msg cs-stmt
 	count: length? params
-	binary/write msg [
+	binary/write tail msg [
 		UI16  0                ; parameter format codes (0 = all text)
 		UI16  :count           ; number of parameter values
 	]
 	foreach p params [
 		enc: encode-param-text p
 		either none? enc [
-			binary/write msg [SI32 -1]
+			binary/write tail msg [SI32 -1]
 		][
 			enc: to binary! enc
-			binary/write msg [SI32 length? enc BYTES :enc]
+			binary/write tail msg [SI32 length? enc BYTES :enc]
 		]
 	]
-	binary/write msg [
+	binary/write tail msg [
 		UI16 0 ; result-column format codes (0 = all text)
 	]
 	msg
@@ -199,12 +199,12 @@ make-describe-message: func [
 	name [any-type!]
 	/local msg cs k
 ][
-	msg: make binary! 32
+	msg: clear make binary! 32
 	cs: make-cstring name
 	k: to integer! kind
 	binary/write msg [UI8 :k]
 	append msg cs
-	msg
+	head msg
 ]
 
 make-execute-message: func [
@@ -213,11 +213,11 @@ make-execute-message: func [
 	max-rows [integer!]
 	/local msg cs mr
 ][
-	msg: make binary! 32
+	msg: clear make binary! 32
 	cs: make-cstring portal-name
 	append msg cs
 	mr: max-rows
-	binary/write msg [UI32 :mr]
+	binary/write tail msg [UI32 :mr]
 	msg
 ]
 
@@ -227,12 +227,12 @@ make-close-message: func [
 	name [any-type!]
 	/local msg cs k
 ][
-	msg: make binary! 32
+	msg: clear make binary! 32
 	cs: make-cstring name
 	k: to integer! kind
 	binary/write msg [UI8 :k]
 	append msg cs
-	msg
+	head msg
 ]
 
 error-fields: #[
@@ -483,6 +483,24 @@ process-responses: function[
 				ctx/CancelKeyData: binary/read bin [UI32 UI32]
 				sys/log/more 'POSTGRES ["CancelKeyData:" ctx/CancelKeyData]
 			]
+			#"A" [
+				;; NotificationResponse (LISTEN/NOTIFY)
+				pid: binary/read bin 'UI32
+				channel: binary/read bin 'STRING
+				payload: binary/read bin 'STRING
+				evt: make map! reduce [
+					'pid pid
+					'channel channel
+					'payload payload
+				]
+				sys/log/more 'POSTGRES ["Notification:" channel payload]
+				; Invoke catch-all handler first (if any), then channel-specific handlers.
+				invoke-callback ctx/notify-any evt
+				handlers: select ctx/notify-handlers channel
+				if block? handlers [
+					foreach h handlers [invoke-callback h evt]
+				]
+			]
 			#"Z" [
 				;; Identifies the message type.
 				;; ReadyForQuery is sent whenever the backend is ready for a new query cycle.
@@ -545,6 +563,82 @@ parse-query-params: func [
 		]
 	]
 	m
+]
+
+pg-quote-ident: func [
+	"Quote SQL identifier (e.g. channel name) if needed"
+	s [string!]
+	/local safe out allowed
+][
+	allowed: charset [
+		#"a" - #"z"
+		#"A" - #"Z"
+		#"0" - #"9"
+		#"_"
+	]
+	safe: parse s [some allowed]
+	either safe [
+		s
+	][
+		out: copy s
+		replace/all out {"} {""}
+		rejoin [{"} out {"}]
+	]
+]
+
+pg-quote-literal: func [
+	"Quote SQL string literal"
+	s [string!]
+	/local out
+][
+	out: copy s
+	replace/all out {'} {''}
+	rejoin [{' out '}]
+]
+
+listen: func [
+	"LISTEN on a channel and register a handler"
+	pg [port!]
+	channel [string!]
+	handler [any-type!]
+	/local ctx handlers
+][
+	unless open? pg [cause-error 'Access 'not-open pg/spec/ref]
+	ctx: pg/extra
+	unless ctx/notify-handlers [ctx/notify-handlers: make map! 20]
+	handlers: any [select ctx/notify-handlers channel copy []]
+	if none? find handlers handler [append/only handlers handler]
+	put ctx/notify-handlers channel handlers
+	write pg ajoin ["LISTEN " pg-quote-ident channel ";"]
+	pg
+]
+
+unlisten: func [
+	"UNLISTEN a channel (and unregister local handlers)"
+	pg [port!]
+	channel [string!]
+	/local ctx
+][
+	unless open? pg [cause-error 'Access 'not-open pg/spec/ref]
+	ctx: pg/extra
+	if all [ctx/notify-handlers select ctx/notify-handlers channel] [
+		remove/key ctx/notify-handlers channel
+	]
+	write pg ajoin ["UNLISTEN " pg-quote-ident channel ";"]
+	pg
+]
+
+notify: func [
+	"Send a NOTIFY"
+	pg [port!]
+	channel [string!]
+	payload [string!]
+][
+	unless open? pg [cause-error 'Access 'not-open pg/spec/ref]
+	write pg ajoin [
+		"NOTIFY " pg-quote-ident channel ", " pg-quote-literal payload ";"
+	]
+	pg
 ]
 
 parse-auth-list: func [
@@ -1336,6 +1430,8 @@ sys/make-scheme [
 				PortalSuspended?: false
 				prepared: make map! 20   ; statement-name -> [sql param-oids]
 				cursors:  make map! 10   ; cursor-id -> [stmt portal max-rows]
+				notify-handlers: make map! 20 ; channel(string) -> [handlers...]
+				notify-any: none              ; optional catch-all handler
 				sasl: context [
 					;; input values...
 					user:     user

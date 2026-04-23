@@ -125,6 +125,29 @@ Notes:
   - `write pg [ASYNC-STREAM "SELECT ..." :on-row :on-done :on-error 50]`
   - Optional end-of-stream hook: `write pg [ASYNC-STREAM "SELECT ..." :on-row :on-done :on-error :on-complete 50]`
 
+### LISTEN/NOTIFY (notifications)
+
+The scheme handles Postgres `NotificationResponse` messages at any time and can dispatch them to user callbacks.
+
+```rebol
+pgsql: import %postgres.reb
+pg: open postgres://postgres:password@localhost/postgres
+
+got: none
+on-notify: func [evt][
+    print ["NOTIFY channel=" evt/channel " payload=" evt/payload]
+    got: evt
+]
+
+listen pg "demo_chan" :on-notify
+
+; In another session (or same connection) send:
+pgsql/notify pg "demo_chan" "hello"
+
+until [wait [pg 10] got]
+close pg
+```
+
 ## Examples and tests
 
 For a fuller usage example (DDL/DML + error cases) see the test script: [`ci-test.r3`](ci-test.r3).

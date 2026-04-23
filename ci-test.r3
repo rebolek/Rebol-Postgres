@@ -77,6 +77,47 @@ foreach [title code] [
 		]
 	]
 
+	"Async queue ordering (F4)" [
+		seen: copy []
+		done-count: 0
+		cb1: func [res][append seen first res/rows done-count: done-count + 1]
+		cb2: func [res][append seen first res/rows done-count: done-count + 1]
+		cb-err: func [err][
+			print ["Async error:" mold err]
+			append seen 'error
+			done-count: done-count + 1
+		]
+		write pg [ASYNC "SELECT 1 AS x" :cb1 :cb-err]
+		write pg [ASYNC "SELECT 2 AS x" :cb2 :cb-err]
+		until [
+			wait [pg 10]
+			done-count = 2
+		]
+		if seen <> ["1" "2"] [
+			cause-error 'Access 'Protocol reduce ['message ajoin ["Async ordering failed; seen=" mold seen]]
+		]
+	]
+
+	"Async error recovery (F4)" [
+		seen: copy []
+		done-count: 0
+		cb-ok: func [res][append seen first res/rows done-count: done-count + 1]
+		cb-err: func [err][append/only seen err done-count: done-count + 1]
+		; error first, then success; connection should remain usable
+		write pg [ASYNC {SELECT * FROM nonexistingtable;} :cb-ok :cb-err]
+		write pg [ASYNC "SELECT 3 AS x" :cb-ok :cb-err]
+		until [
+			wait [pg 10]
+			done-count = 2
+		]
+		if any [
+			not error? first seen
+			second seen <> "3"
+		][
+			cause-error 'Access 'Protocol reduce ['message ajoin ["Async error recovery failed; seen=" mold seen]]
+		]
+	]
+
 	"Async streaming rows (F2)" [
 		rows-seen: 0
 		done: none
@@ -139,6 +180,27 @@ foreach [title code] [
 		if any [done <> 'ok none? completed] [
 			cause-error 'Access 'Protocol reduce ['message ajoin ["Async on-complete failed; done=" mold done " completed=" mold completed]]
 		]
+	]
+
+	"LISTEN/NOTIFY delivery (F4)" [
+		pg2: open as url! pg-url
+		got: none
+		listener: func [evt][got: evt]
+		pgsql/listen pg "ci_chan" :listener
+		; send from second session
+		write pg2 {NOTIFY ci_chan, 'hello-ci';}
+		until [
+			wait [pg 10]
+			not none? got
+		]
+		if any [
+			not map? got
+			select got 'channel <> "ci_chan"
+			select got 'payload <> "hello-ci"
+		][
+			cause-error 'Access 'Protocol reduce ['message ajoin ["NOTIFY test failed; got=" mold got]]
+		]
+		close pg2
 	]
 
 	"Creating test tables" [
