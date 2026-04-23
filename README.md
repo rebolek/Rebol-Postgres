@@ -86,6 +86,42 @@ if error? :err [
 - `notices`: notices received during the query
 - `runtime`: collected runtime parameters (`ParameterStatus`)
 
+### Async queries + streaming rows
+
+The scheme supports a simple **async** API via `write` block forms. This is useful for event-driven programs where you don’t want `write` to block.
+
+- **Async query**: returns immediately and calls completion callbacks later
+
+```rebol
+done: none
+on-done: func [res] [print ["DONE tag:" res/command-tag] done: true]
+on-error: func [err] [print ["ERROR:" select err 'message] done: true]
+
+; Enqueue and return immediately:
+write pg [ASYNC "SELECT 1 AS x" :on-done :on-error]
+
+; Let the port wake as IO progresses:
+until [wait [pg 5] done]
+```
+
+- **Async streaming**: delivers rows incrementally via `on-row` (does not buffer all rows in memory)
+
+```rebol
+rows-seen: 0
+done: none
+on-row:  func [row] [rows-seen: rows-seen + 1] ; row shaping/decoding respects row= and decode=
+on-done: func [res] [print ["DONE rows:" rows-seen] done: true]
+on-error: func [err] [print ["ERROR:" select err 'message] done: true]
+
+write pg [ASYNC-STREAM "SELECT generate_series(1, 250) AS x" :on-row :on-done :on-error]
+until [wait [pg 10] done]
+```
+
+Notes:
+
+- Requests on a single connection are **processed sequentially** (Postgres protocol requires this). Async calls are queued and resolved in order.
+- Callbacks are invoked from the port’s IO/awake processing; keep handlers fast and non-blocking.
+
 ## Examples and tests
 
 For a fuller usage example (DDL/DML + error cases) see the test script: [`ci-test.r3`](ci-test.r3).

@@ -77,6 +77,53 @@ foreach [title code] [
 		]
 	]
 
+	"Async streaming rows (F2)" [
+		rows-seen: 0
+		done: none
+		cb-row: func [row][
+			rows-seen: rows-seen + 1
+		]
+		cb-ok: func [res][
+			done: 'ok
+		]
+		cb-err: func [err][
+			print ["Async stream error:" mold err]
+			done: 'error
+		]
+		write pg [ASYNC-STREAM "SELECT generate_series(1, 250) AS x" :cb-row :cb-ok :cb-err]
+		until [
+			wait [pg 10]
+			not none? done
+		]
+		if any [done <> 'ok rows-seen <> 250] [
+			cause-error 'Access 'Protocol reduce ['message ajoin ["Async stream failed; done=" mold done " rows=" rows-seen]]
+		]
+	]
+
+	"Async streaming rows chunked via portal (F2)" [
+		rows-seen: 0
+		done: none
+		cb-row: func [row][
+			rows-seen: rows-seen + 1
+		]
+		cb-ok: func [res][
+			done: 'ok
+		]
+		cb-err: func [err][
+			print ["Async stream(chunked) error:" mold err]
+			done: 'error
+		]
+		; last argument is max-rows per fetch
+		write pg [ASYNC-STREAM "SELECT generate_series(1, 250) AS x" :cb-row :cb-ok :cb-err 50]
+		until [
+			wait [pg 10]
+			not none? done
+		]
+		if any [done <> 'ok rows-seen <> 250] [
+			cause-error 'Access 'Protocol reduce ['message ajoin ["Async stream(chunked) failed; done=" mold done " rows=" rows-seen]]
+		]
+	]
+
 	"Creating test tables" [
 		write pg {
 BEGIN;

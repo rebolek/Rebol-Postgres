@@ -407,7 +407,17 @@ process-responses: function[
 					sys/log/more 'POSTGRES ["Column data:^[[m" ellipsize copy/part tmp 80 75]
 					append row tmp
 				]
-				append/only ctx/data row
+				either all [
+					ctx/inflight
+					select ctx/inflight 'stream?
+					select ctx/inflight 'on-row
+				][
+					ctx/inflight/row-index: ctx/inflight/row-index + 1
+					shaped: shape-row ctx row
+					invoke-callback ctx/inflight/on-row shaped
+				][
+					append/only ctx/data row
+				]
 			]
 			#"C" [
 				;; Identifies the message as a command-completed response.
@@ -652,6 +662,51 @@ shape-rows: func [
 	rows-out
 ]
 
+shape-row: func [
+	"Shape + optionally decode a single row"
+	ctx [object!]
+	row [block!]
+	/local mode decode cols names out-row i col oid row-map n
+][
+	mode: any [all [ctx/options select ctx/options 'row-mode] 'flat]
+	decode: any [all [ctx/options select ctx/options 'decode] 'off]
+	cols: ctx/RowDescription
+
+	; Build a list of column names (aligned with row values).
+	names: collect [
+		foreach col cols [keep col/1]
+	]
+
+	out-row: row
+	if decode = 'basic [
+		out-row: copy row
+		i: 0
+		foreach v out-row [
+			++ i
+			col: pick cols i
+			oid: any [all [col integer? col/4 col/4] 0]
+			change at out-row i decode-basic-value oid v
+		]
+	]
+
+	switch mode [
+		block [out-row]
+		map [
+			row-map: make map! (2 * length? names)
+			i: 0
+			foreach n names [
+				++ i
+				put row-map to word! n pick out-row i
+			]
+			row-map
+		]
+		flat [
+			; For streaming, return the row values (not nested).
+			out-row
+		]
+	]
+]
+
 parse-sslmode: func [
 	"Parse sslmode option into one of: disable/prefer/require"
 	s [any-type!]
@@ -690,6 +745,17 @@ reset-result-state: func [
 	clear ctx/Data
 	clear ctx/RowDescription
 	; runtime is connection-wide; don't clear it per request
+]
+
+reset-fetch-state: func [
+	"Reset only fields needed between portal FETCH chunks"
+	ctx [object!]
+][
+	ctx/error: none
+	ctx/CommandComplete: none
+	ctx/PortalSuspended?: false
+	clear ctx/Data
+	; keep RowDescription, notices, runtime
 ]
 
 invoke-callback: func [
@@ -906,8 +972,21 @@ start-next-request: function [
 
 	req: take ctx/request-queue
 	ctx/inflight: req
+	req/row-index: 0
 	reset-result-state ctx
-	queue-command ctx req/data
+	; Optional chunked streaming using portal fetches when a max-rows is provided.
+	either all [
+		req/stream?
+		select req 'max-rows
+		integer? req/max-rows
+		req/max-rows > 0
+		string? req/data
+	][
+		req/cursor-id: to word! ajoin ["as-" form req/id]
+		queue-command ctx reduce ['CURSOR req/cursor-id req/data copy [] req/max-rows]
+	][
+		queue-command ctx req/data
+	]
 
 	; kick IO if connection is already ready
 	if all [
@@ -928,6 +1007,27 @@ finish-inflight: function [
 	req: ctx/inflight
 	unless req [return none]
 
+	; If streaming using portal chunks, keep fetching while suspended.
+	if all [
+		req/stream?
+		select req 'max-rows
+		integer? req/max-rows
+		req/max-rows > 0
+		ctx/PortalSuspended?
+		select req 'cursor-id
+	][
+		reset-fetch-state ctx
+		queue-command ctx reduce ['FETCH req/cursor-id]
+		if all [
+			ctx/ReadyForQuery
+			pg/state = 'READY
+		][
+			pg/state: 'WRITE
+			write ctx/connection take/part ctx/out-buffer 32000
+		]
+		return none
+	]
+
 	; build either result or error and invoke callbacks
 	either ctx/error [
 		req/status: 'error
@@ -938,6 +1038,25 @@ finish-inflight: function [
 		req/status: 'done
 		req/result: build-result ctx
 		invoke-callback req/on-done req/result
+	]
+
+	; Best-effort cleanup for chunked streaming: close cursor after completion.
+	if all [
+		req/stream?
+		select req 'max-rows
+		integer? req/max-rows
+		req/max-rows > 0
+		select req 'cursor-id
+	][
+		reset-fetch-state ctx
+		queue-command ctx reduce ['CLOSE-CURSOR req/cursor-id]
+		if all [
+			ctx/ReadyForQuery
+			pg/state = 'READY
+		][
+			pg/state: 'WRITE
+			write ctx/connection take/part ctx/out-buffer 32000
+		]
 	]
 
 	ctx/inflight: none
@@ -1285,12 +1404,47 @@ sys/make-scheme [
 		write: func [
 			port [port!]
 			data [string! word! block!]
-			/local ctx req on-done on-error blk req-data
+			/local ctx req on-row on-done on-error blk req-data
 		][
 			unless open? port [
 				cause-error 'Access 'not-open port/spec/ref
 			]
 			ctx: port/extra
+			;-- Async streaming block form: [ASYNC-STREAM <data> :on-row :on-done :on-error]
+			if all [block? data 'ASYNC-STREAM = first data] [
+				blk: data
+				req-data: second blk
+				on-row: any [third blk none]
+				on-done: any [fourth blk none]
+				on-error: any [fifth blk none]
+				max-rows: any [sixth blk 0]
+
+				ctx/next-req-id: ctx/next-req-id + 1
+				req: make object! [
+					id: none
+					status: 'pending
+					data: none
+					stream?: true
+					row-index: 0
+					max-rows: 0
+					cursor-id: none
+					on-row: none
+					on-done: none
+					on-error: none
+					result: none
+					error: none
+				]
+				req/id: ctx/next-req-id
+				req/data: req-data
+				req/max-rows: to integer! max-rows
+				req/on-row: on-row
+				req/on-done: on-done
+				req/on-error: on-error
+				append ctx/request-queue req
+				start-next-request port
+				return req
+			]
+
 			;-- Async block form: [ASYNC <data> :on-done :on-error]
 			if all [block? data 'ASYNC = first data] [
 				blk: data
@@ -1303,6 +1457,9 @@ sys/make-scheme [
 					id: none
 					status: 'pending
 					data: none
+					stream?: false
+					row-index: 0
+					on-row: none
 					on-done: none
 					on-error: none
 					result: none
@@ -1310,6 +1467,7 @@ sys/make-scheme [
 				]
 				req/id: ctx/next-req-id
 				req/data: req-data
+				req/on-row: none
 				req/on-done: on-done
 				req/on-error: on-error
 				append ctx/request-queue req
