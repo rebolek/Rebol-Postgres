@@ -10,4 +10,34 @@
 
 Current state of the scheme is under development and may be changed in any moment.
 
-For usage example see the [test file](ci-test.r3).
+## Usage
+
+Open a connection using the `postgres://` scheme.
+
+```rebol
+pgsql: import %postgres.reb
+
+; user/pass are taken from the URL, database is taken from the URL path:
+pg: open postgres://postgres:password@localhost/postgres
+
+res: write pg "SELECT current_user, current_database();"
+probe res/rows
+probe res/columns
+print res/command-tag
+
+close pg
+```
+
+### `write` result
+
+`write` returns a `map!` with these keys:
+
+- `rows`: block of row values (currently text-decoded)
+- `columns`: block of column metadata maps (name, type oid, etc.)
+- `command-tag`: command completion tag (e.g. `"SELECT 1"`)
+- `notices`: notices received during the query
+- `runtime`: collected runtime parameters (`ParameterStatus`)
+
+## Examples and tests
+
+For a fuller usage example (DDL/DML + error cases) see the test script: [`ci-test.r3`](ci-test.r3).

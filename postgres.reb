@@ -214,7 +214,7 @@ process-responses: function[
 				;; Identifies the message as a row description.
 				cols: binary/read bin 'UI16
 				loop cols [
-					append ctx/RowDescription tmp: binary/read bin [
+					append/only ctx/RowDescription tmp: binary/read bin [
 						STRING ;; The field name.
 						SI32   ;; If the field can be identified as a column of a specific table, the object ID of the table; otherwise zero.
 						SI16   ;; If the field can be identified as a column of a specific table, the attribute number of the column; otherwise zero.
@@ -262,6 +262,8 @@ process-responses: function[
 					ctx/error: make map! err
 					sys/log/error 'POSTGRES any [select err 'message "Malformed error message"]
 				][
+					;-- Keep notices so `write` can return them.
+					append ctx/notices make map! err
 					sys/log/info 'POSTGRES ["NOTICE:" select err 'message]
 				]
 			]
@@ -293,6 +295,14 @@ process-responses: function[
 	truncate bin/buffer
 	;; Return true if the input buffer is empty
 	tail? bin/buffer
+]
+
+clean-cstring: func [
+	"Remove C-string terminator if present"
+	s [string!]
+	/local p
+][
+	either p: find s null [copy/part s p][s]
 ]
 
 pg-conn-awake: function [event][
@@ -437,6 +447,7 @@ sys/make-scheme [
 				state: none
 				error: none
 				runtime: make block! 30
+				notices: make block! 10
 				out-buffer: make binary! 1000
 				inp-buffer: make binary! 1000
 				authenticated?: false
@@ -515,7 +526,7 @@ sys/make-scheme [
 		write: func [
 			port [port!]
 			data [string! word!]
-			/local ctx
+			/local ctx cols result rt
 		][
 			unless open? port [
 				cause-error 'Access 'not-open port/spec/ref
@@ -523,6 +534,7 @@ sys/make-scheme [
 			ctx: port/extra
 			ctx/error: none
 			ctx/CommandComplete: none
+			clear ctx/notices
 			clear ctx/Data
 			clear ctx/RowDescription
 			case [
@@ -555,7 +567,30 @@ sys/make-scheme [
 						port/state: 'READY
 						cause-error 'Access 'Protocol ctx/error
 					]
-					ctx/CommandComplete [ ctx/Data ]
+					ctx/CommandComplete [
+						cols: collect [
+							foreach col ctx/RowDescription [
+								keep make map! reduce [
+									'name col/1
+									'table-oid col/2
+									'attr-number col/3
+									'type-oid col/4
+									'type-size col/5
+									'type-mod col/6
+									'format col/7
+								]
+							]
+						]
+						rt: make map! ctx/runtime
+						result: make map! reduce [
+							'rows ctx/Data
+							'columns cols
+							'command-tag clean-cstring any [ctx/CommandComplete ""]
+							'notices ctx/notices
+							'runtime rt
+						]
+						result
+					]
 				]
 			]
 		]

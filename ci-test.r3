@@ -17,7 +17,7 @@ system/options/log/postgres: 3
 
 foreach [title code] [
 	"Opening a connection" [
-		pg: open postgres://postgress:password@localhost
+		pg: open postgres://postgres:password@localhost
 	]
 
 	"Simple query (get PostgreSQL version)" [
