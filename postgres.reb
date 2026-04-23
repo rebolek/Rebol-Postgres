@@ -315,7 +315,7 @@ pg-conn-awake: function [event][
 		connect [
 			sys/log/more 'POSTGRES "Sending startup..."
 			pg/state: 'WRITE
-			write conn make-startup-message "postgres" "postgres"
+			write conn make-startup-message ctx/user ctx/database
 			false
 		]
 
@@ -412,14 +412,26 @@ sys/make-scheme [
 	actor: [
 		open: func [
 			port [port!]
-			/local conn spec
+			/local conn spec user database db
 		] [
 			if port/extra [return port]
 
 			spec: port/spec
 			;? spec
 
+			user: any [select spec 'user "postgres"]
+			database: any [
+				all [
+					spec/path
+					not empty? db: form spec/path
+					either db/1 = #"/" [next db][db]
+				]
+				user
+			]
+
 			port/extra: object [
+				user:
+				database:
 				connection:
 				awake: :port/awake
 				state: none
@@ -436,7 +448,7 @@ sys/make-scheme [
 				CommandComplete: none
 				sasl: context [
 					;; input values...
-					user:     any [select spec 'user "postgres"]
+					user:     user
 					password: any [select spec 'pass "postgres"]
 					mechanisms: copy []
 					salt: none
@@ -457,6 +469,8 @@ sys/make-scheme [
 					ClientProof: none
 				]
 			]
+			port/extra/user: user
+			port/extra/database: database
 
 			port/state: 'INIT
 
