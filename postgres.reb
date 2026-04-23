@@ -179,10 +179,26 @@ process-responses: function[
 					]
 					3 [
 						;; AuthenticationCleartextPassword
+						unless all [
+							ctx/options
+							select ctx/options 'allow-cleartext?
+						][
+							ctx/error: make map! reduce ['message "Cleartext password auth disabled by client"]
+							sys/log/error 'POSTGRES select ctx/error 'message
+							break
+						]
 						que-packet ctx #"p" join ctx/sasl/password null
 					]
 					5 [
 						;; AuthenticationMD5Password
+						unless any [
+							not ctx/options
+							find select ctx/options 'auth 'md5
+						][
+							ctx/error: make map! reduce ['message "MD5 password auth disabled by client"]
+							sys/log/error 'POSTGRES select ctx/error 'message
+							break
+						]
 						salt: binary/read bin 4
 						que-packet ctx #"p" join md5-password ctx/sasl/user ctx/sasl/password salt null
 					]
@@ -199,7 +215,13 @@ process-responses: function[
 						]
 						;; Choose a supported mechanism from the offered list.
 						case [
-							find tmp "SCRAM-SHA-256" [
+							all [
+								any [
+									not ctx/options
+									find select ctx/options 'auth 'scram
+								]
+								find tmp "SCRAM-SHA-256"
+							][
 								ctx/sasl/mechanism: "SCRAM-SHA-256"
 								sys/log/debug 'POSTGRES ["Using SASL mechanism:" ctx/sasl/mechanism]
 								que-packet ctx #"p" authenticate ctx
@@ -359,6 +381,42 @@ clean-cstring: func [
 	either p: find s null [copy/part s p][s]
 ]
 
+parse-query-params: func [
+	"Parse URL query string into a map"
+	q [any-type!]
+	/local m s part k v eq
+][
+	m: make map! 8
+	if any [none? q empty? s: form q] [return m]
+	foreach part split s #"&" [
+		either eq: find part #"=" [
+			k: copy/part part eq
+			v: copy next eq
+		][
+			k: part
+			v: "true"
+		]
+		if all [k not empty? k] [
+			put m to word! k v
+		]
+	]
+	m
+]
+
+parse-auth-list: func [
+	"Parse auth option value into list of allowed methods"
+	s [any-type!]
+	/local out item val
+][
+	out: make block! 4
+	if any [none? s empty? val: trim form s] [return out]
+	foreach item split val #"," [
+		item: lowercase trim item
+		if not empty? item [append out to word! item]
+	]
+	out
+]
+
 pg-conn-awake: function [event][
 	conn:  event/port  ;; The real TCP connection
 	pg:    conn/parent ;; Higher level postgress port
@@ -476,7 +534,7 @@ sys/make-scheme [
 	actor: [
 		open: func [
 			port [port!]
-			/local conn spec user database db
+			/local conn spec user database db params allowed-auth
 		] [
 			if port/extra [return port]
 
@@ -496,6 +554,7 @@ sys/make-scheme [
 			port/extra: object [
 				user:
 				database:
+				options:
 				connection:
 				awake: :port/awake
 				state: none
@@ -538,6 +597,16 @@ sys/make-scheme [
 				]
 			]
 			port/extra/user: user
+			params: parse-query-params spec/query
+			allowed-auth: any [
+				all [select params 'auth parse-auth-list select params 'auth]
+				[ scram md5 cleartext ]
+			]
+			port/extra/options: make map! reduce [
+				'auth allowed-auth
+				'allow-cleartext? not none? find allowed-auth 'cleartext
+			]
+			database: any [select params 'database database]
 			port/extra/database: database
 
 			port/state: 'INIT

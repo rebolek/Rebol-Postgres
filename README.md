@@ -28,6 +28,23 @@ print res/command-tag
 close pg
 ```
 
+### Connection options (query params)
+
+You can pass a small set of options using URL query params:
+
+- `database=<name>`: overrides the database from the URL path
+- `auth=<list>`: comma-separated list of allowed authentication methods: `scram,md5,cleartext`
+
+Examples:
+
+```rebol
+; force database without changing the URL path
+pg: open postgres://postgres:password@localhost?database=postgres
+
+; allow only SCRAM (disable MD5 + cleartext)
+pg: open postgres://postgres:password@localhost/postgres?auth=scram
+```
+
 ### Error handling
 
 On protocol/query errors `write` raises an error whose argument is a `map!` of server error fields
