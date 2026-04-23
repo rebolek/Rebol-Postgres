@@ -39,7 +39,20 @@ foreach [title code] [
 
 	"Extended query protocol demo (opt-in via PG_EXT=1)" [
 		if "1" = any [get-env "PG_EXT" "0"] [
-			write pg reduce ['EXEC "SELECT $1::int4 AS x, $2::text AS y" [123 "hello"]]
+			;; Unnamed statement/portal
+			write pg [EXEC "SELECT $1::int4 AS x, $2::text AS y" [123 "hello"]]
+
+			;; Named prepared statement
+			write pg [PREPARE demo "SELECT $1::int4 AS x, $2::text AS y" none]
+			write pg [EXECUTE demo [123 "hello"]]
+			write pg [DEALLOCATE demo]
+
+			;; Cursor / chunk fetch (should suspend at least once)
+			res: write pg [CURSOR g "SELECT generate_series(1, 250) AS x" [] 50]
+			while [all [map? res select res 'more?]] [
+				res: write pg [FETCH g]
+			]
+			write pg [CLOSE-CURSOR g]
 		]
 	]
 

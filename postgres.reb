@@ -215,6 +215,19 @@ make-execute-message: func [
 	msg
 ]
 
+make-close-message: func [
+	"Build Close message body (S=statement, P=portal)"
+	kind [char!]
+	name [any-type!]
+][
+	msg: make binary! 32
+	binary/write msg [
+		UI8   to integer! kind
+		BYTES :make-cstring name
+	]
+	msg
+]
+
 error-fields: #[
 	;- https://www.postgresql.org/docs/current/protocol-error-fields.html
 	0#53 localized-severity   ;= S - the field contents are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE, DEBUG, INFO, or LOG (in a notice message), or a localized translation of one of these. Always present.
@@ -903,6 +916,8 @@ sys/make-scheme [
 				Data: make block! 1000
 				CommandComplete: none
 				PortalSuspended?: false
+				prepared: make map! 20   ; statement-name -> [sql param-oids]
+				cursors:  make map! 10   ; cursor-id -> [stmt portal max-rows]
 				sasl: context [
 					;; input values...
 					user:     user
@@ -1016,9 +1031,40 @@ sys/make-scheme [
 				]
 				block? data [
 					switch/default first data [
+						PREPARE [
+							; [PREPARE name "SQL" [oids]]
+							stmt: second data
+							unless any [word? stmt string? stmt] [
+								ctx/error: #[message: "PREPARE expects statement name as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							unless string? third data [
+								ctx/error: #[message: "PREPARE expects SQL string as third item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							sql: third data
+							param-oids: any [fourth data none]
+							if all [param-oids not block? param-oids] [param-oids: to block! param-oids]
+							; cache client-side (for reconnect / introspection)
+							put ctx/prepared to word! form stmt reduce [sql param-oids]
+							; Parse + Sync
+							que-packet ctx #"P" make-parse-message stmt sql param-oids
+							que-packet ctx #"S" ""
+						]
+						DEALLOCATE [
+							; [DEALLOCATE name]
+							stmt: second data
+							unless any [word? stmt string? stmt] [
+								ctx/error: compose #[message: "DEALLOCATE expects statement name as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							remove/key ctx/prepared to word! form stmt
+							que-packet ctx #"C" make-close-message #"S" stmt
+							que-packet ctx #"S" ""
+						]
 						EXEC [
 							unless string? second data [
-								ctx/error: make map! reduce ['message "EXEC expects SQL string as second item"]
+								ctx/error: compose #[message: "EXEC expects SQL string as second item"]
 								cause-error 'Access 'Protocol ctx/error
 							]
 							sql: second data
@@ -1032,9 +1078,84 @@ sys/make-scheme [
 							que-packet ctx #"E" make-execute-message "" 0
 							que-packet ctx #"S" ""
 						]
+						EXECUTE [
+							; [EXECUTE name [params]]
+							stmt: second data
+							unless any [word? stmt string? stmt] [
+								ctx/error: compose #[message: "EXECUTE expects statement name as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							params: any [third data copy []]
+							unless block? params [params: to block! params]
+							que-packet ctx #"B" make-bind-message "" stmt params
+							que-packet ctx #"D" make-describe-message #"P" ""
+							que-packet ctx #"E" make-execute-message "" 0
+							que-packet ctx #"S" ""
+						]
+						CURSOR [
+							; [CURSOR id "SQL" [params] max-rows]
+							cursor-id: second data
+							unless any [word? cursor-id string? cursor-id] [
+								ctx/error: compose #[message: "CURSOR expects cursor id as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							unless string? third data [
+								ctx/error: compose #[message: "CURSOR expects SQL string as third item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							sql: third data
+							params: any [fourth data copy []]
+							unless block? params [params: to block! params]
+							max-rows: to integer! any [fifth data 100]
+							stmt-name: ajoin ["stmt-" form cursor-id]
+							portal-name: ajoin ["cur-" form cursor-id]
+							put ctx/cursors to word! form cursor-id reduce [stmt-name portal-name max-rows]
+							; Parse (named) + Bind (named portal) + Describe (portal) + Execute(max) + Sync
+							que-packet ctx #"P" make-parse-message stmt-name sql none
+							que-packet ctx #"B" make-bind-message portal-name stmt-name params
+							que-packet ctx #"D" make-describe-message #"P" portal-name
+							que-packet ctx #"E" make-execute-message portal-name max-rows
+							que-packet ctx #"S" ""
+						]
+						FETCH [
+							; [FETCH id]
+							cursor-id: second data
+							unless any [word? cursor-id string? cursor-id] [
+								ctx/error: compose #[message: "FETCH expects cursor id as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							info: select ctx/cursors to word! form cursor-id
+							unless info [
+								ctx/error: compose #[message: (ajoin ["Unknown cursor id: " form cursor-id])]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							portal-name: info/2
+							max-rows: info/3
+							que-packet ctx #"E" make-execute-message portal-name max-rows
+							que-packet ctx #"S" ""
+						]
+						CLOSE-CURSOR [
+							; [CLOSE-CURSOR id]
+							cursor-id: second data
+							unless any [word? cursor-id string? cursor-id] [
+								ctx/error: compose #[message: "CLOSE-CURSOR expects cursor id as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							info: select ctx/cursors to word! form cursor-id
+							unless info [
+								ctx/error: compose #[message: (ajoin ["Unknown cursor id: " form cursor-id])]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							portal-name: info/2
+							stmt-name: info/1
+							remove/key ctx/cursors to word! form cursor-id
+							que-packet ctx #"C" make-close-message #"P" portal-name
+							que-packet ctx #"C" make-close-message #"S" stmt-name
+							que-packet ctx #"S" ""
+						]
 					][
-						ctx/error: make map! reduce [
-							'message ajoin ["Unsupported write block form: " mold data]
+						ctx/error: compose #[
+							message: (ajoin ["Unsupported write block form: " mold data])
 						]
 						cause-error 'Access 'Protocol ctx/error
 					]
@@ -1060,30 +1181,60 @@ sys/make-scheme [
 						ctx/last-error: ctx/error
 						cause-error 'Access 'Protocol ctx/error
 					]
-					ctx/CommandComplete [
+					ctx/PortalSuspended? [
 						cols: collect [
 							foreach col ctx/RowDescription [
-								keep make map! reduce [
-									'name col/1
-									'table-oid col/2
-									'attr-number col/3
-									'type-oid col/4
-									'type-size col/5
-									'type-mod col/6
-									'format col/7
+								keep compose #[
+									name: (col/1)
+									table-oid: (col/2)
+									attr-number: (col/3)
+									type-oid: (col/4)
+									type-size: (col/5)
+									type-mod: (col/6)
+									format: (col/7)
 								]
 							]
 						]
 						rt: make map! ctx/runtime
 						rows: shape-rows ctx
-						result: make map! reduce [
-							'rows rows
-							'columns cols
-							'command-tag clean-cstring any [ctx/CommandComplete ""]
-							'notices ctx/notices
-							'runtime rt
-							'row-mode select ctx/options 'row-mode
-							'decode select ctx/options 'decode
+						result: compose #[
+							rows: (rows)
+							columns: (cols)
+							command-tag: (none)
+							notices: (ctx/notices)
+							runtime: (rt)
+							row-mode: (select ctx/options 'row-mode)
+							decode: (select ctx/options 'decode)
+							more?: (true)
+						]
+						ctx/last-result: result
+						result
+					]
+					ctx/CommandComplete [
+						cols: collect [
+							foreach col ctx/RowDescription [
+								keep compose #[
+									name: (col/1)
+									table-oid: (col/2)
+									attr-number: (col/3)
+									type-oid: (col/4)
+									type-size: (col/5)
+									type-mod: (col/6)
+									format: (col/7)
+								]
+							]
+						]
+						rt: make map! ctx/runtime
+						rows: shape-rows ctx
+						result: #[
+							rows: (rows)
+							columns: (cols)
+							command-tag: (clean-cstring any [ctx/CommandComplete ""])
+							notices: (ctx/notices)
+							runtime: (rt)
+							row-mode: (select ctx/options 'row-mode)
+							decode: (select ctx/options 'decode)
+							more?: (false)
 						]
 						ctx/last-result: result
 						result
