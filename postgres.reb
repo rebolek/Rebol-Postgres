@@ -92,13 +92,16 @@ make-startup-message: funct [
 	;- This packet is special and so is not used in a output que!
 	user     [string!]
 	database [string!]
+	options  [map! none!]
 ] [
 	; Send StartupMessage
+	app: any [all [options select options 'application_name] none]
 	startup-message: rejoin [
 		#{00000000} ; Length placeholder
 		#{00030000} ; Protocol version (3.0)
 		"user^@"     user     null ; Default username
 		"database^@" database null ; Default database
+		either app [rejoin ["application_name^@" app null]][copy ""]
 		null ; Terminator
 	]
 
@@ -113,13 +116,38 @@ que-packet: function[
 	ctx type msg
 ][
 	out: tail ctx/out-buffer
-	sys/log/debug 'POSTGRES ["Client-> type:" as-blue type as-yellow mold msg]
+	; Avoid leaking auth secrets in logs, and allow log verbosity control.
+	trace?: all [ctx/options select ctx/options 'trace?]
+	either type = #"p" [
+		sys/log/debug 'POSTGRES ["Client-> type:" as-blue type as-yellow "<auth redacted>"]
+	][
+		either trace? [
+			sys/log/debug 'POSTGRES ["Client-> type:" as-blue type as-yellow mold msg]
+		][
+			sys/log/debug 'POSTGRES ["Client-> type:" as-blue type "len:" length? msg]
+		]
+	]
 	len: 4 + length? msg
 	binary/write out [
 		UI8 :type
 		UI32 :len
 		BYTES :msg
 	]
+]
+
+make-cancel-request: func [
+	"Build CancelRequest packet (len=16, code=80877102)"
+	pid [integer!]
+	key [integer!]
+][
+	pkt: make binary! 16
+	binary/write pkt [
+		UI32 16
+		UI32 80877102
+		UI32 pid
+		UI32 key
+	]
+	pkt
 ]
 
 make-cstring: func [
@@ -559,6 +587,47 @@ parse-query-params: func [
 	m
 ]
 
+parse-timeout-seconds: func [
+	"Parse timeout seconds (integer >= 0); returns none on invalid"
+	s [any-type!]
+	/local v n
+][
+	if none? s [return none]
+	v: trim form s
+	if empty? v [return none]
+	n: attempt [to integer! v]
+	if any [none? n n < 0] [return none]
+	n
+]
+
+parse-trace-flag: func [
+	"Parse a boolean-ish query flag"
+	s [any-type!]
+	/local v
+][
+	v: lowercase trim form any [s ""]
+	any [
+		v = "1"
+		v = "true"
+		v = "on"
+		v = "yes"
+		v = "trace"
+	]
+]
+
+parse-log-level: func [
+	"Parse log level integer (returns none if invalid)"
+	s [any-type!]
+	/local v n
+][
+	if none? s [return none]
+	v: trim form s
+	if empty? v [return none]
+	n: attempt [to integer! v]
+	if any [none? n n < 0 n > 9] [return none]
+	n
+]
+
 pg-quote-ident: func [
 	"Quote SQL identifier (e.g. channel name) if needed"
 	s [string!]
@@ -569,6 +638,7 @@ pg-quote-ident: func [
 		#"A" - #"Z"
 		#"0" - #"9"
 		#"_"
+		#"$"
 	]
 	safe: parse s [some allowed]
 	either safe [
@@ -578,6 +648,33 @@ pg-quote-ident: func [
 		replace/all out {"} {""}
 		rejoin [{"} out {"}]
 	]
+]
+
+format-search-path: func [
+	"Format search_path list safely (supports $user and comma-separated schema names)"
+	raw [any-type!]
+	/local items out item trimmed res
+][
+	items: split trim form any [raw ""] #","
+	out: make block! 8
+	foreach item items [
+		trimmed: trim form item
+		if empty? trimmed [continue]
+		either trimmed = "$user" [
+			append out "$user"
+		][
+			append out pg-quote-ident trimmed
+		]
+	]
+	if empty? out [return none]
+	res: form out/1
+	if 1 < length? out [
+		foreach item next out [
+			append res ", "
+			append res form item
+		]
+	]
+	res
 ]
 
 pg-quote-literal: func [
@@ -633,6 +730,39 @@ notify: func [
 		"NOTIFY " pg-quote-ident channel ", " pg-quote-literal payload ";"
 	]
 	pg
+]
+
+cancel: func [
+	"Send CancelRequest for currently inflight query (if possible)"
+	pg [port!]
+	/local ctx key pid cancel-conn pkt host port res
+][
+	unless port? :pg [cause-error 'Script 'invalid-arg reduce ['cancel pg]]
+	unless open? pg [return false]
+	ctx: pg/extra
+	unless ctx/inflight [return false]
+	unless all [ctx/CancelKeyData block? ctx/CancelKeyData 2 <= length? ctx/CancelKeyData] [
+		cause-error 'Access 'Protocol make map! reduce ['message "CancelRequest unavailable (missing BackendKeyData)"]
+	]
+	pid: to integer! ctx/CancelKeyData/1
+	key: to integer! ctx/CancelKeyData/2
+	host: pg/spec/host
+	port: pg/spec/port
+	pkt: make-cancel-request pid key
+	cancel-conn: make port! [
+		scheme: 'tcp
+		host: host
+		port: port
+		ref:  rejoin [tcp:// host #":" port]
+	]
+	res: try [
+		open cancel-conn
+		write cancel-conn pkt
+		close cancel-conn
+		true
+	]
+	if error? :res [return false]
+	true
 ]
 
 parse-auth-list: func [
@@ -1207,7 +1337,7 @@ pg-conn-awake: function [event][
 			;-- TLS handshake finished OR plaintext connect: send StartupMessage.
 			sys/log/more 'POSTGRES "Sending startup..."
 			pg/state: 'WRITE
-			write conn make-startup-message ctx/user ctx/database
+			write conn make-startup-message ctx/user ctx/database ctx/options
 			false
 		]
 
@@ -1266,7 +1396,7 @@ pg-conn-awake: function [event][
 						;-- Continue plaintext by sending StartupMessage.
 						sys/log/more 'POSTGRES "Continuing in plaintext (sslmode=prefer)."
 						pg/state: 'WRITE
-						write conn make-startup-message ctx/user ctx/database
+						write conn make-startup-message ctx/user ctx/database ctx/options
 						return false
 					]
 				][
@@ -1328,7 +1458,11 @@ pg-conn-awake: function [event][
 			false
 		]
 		close [
-			ctx/error: "Port closed on me"
+			; If the underlying socket closes unexpectedly while a request is inflight,
+			; surface it as a protocol error. Otherwise treat it as a normal close.
+			if all [ctx ctx/inflight] [
+				ctx/error: make map! reduce ['message "Port closed on me"]
+			]
 		]
 	]
 	if ctx/error [
@@ -1380,6 +1514,7 @@ sys/make-scheme [
 		open: func [
 			port [port!]
 			/local conn spec user database db params allowed-auth sslmode row-mode decode-mode
+			connect-timeout query-timeout app-name search-path log-level trace? handshake-timeout
 		] [
 			if port/extra [return port]
 
@@ -1456,6 +1591,12 @@ sys/make-scheme [
 			sslmode: parse-sslmode select params 'sslmode
 			row-mode: parse-row-mode select params 'row
 			decode-mode: parse-decode-mode select params 'decode
+			connect-timeout: parse-timeout-seconds any [select params 'connect-timeout select params 'connect_timeout]
+			query-timeout: parse-timeout-seconds any [select params 'query-timeout select params 'query_timeout]
+			app-name: any [select params 'application_name select params 'application-name]
+			search-path: any [select params 'search_path select params 'search-path]
+			log-level: parse-log-level select params 'log
+			trace?: parse-trace-flag any [select params 'trace select params 'debug]
 			port/extra/options: make map! reduce [
 				'auth allowed-auth
 				'allow-cleartext? not none? find allowed-auth 'cleartext
@@ -1463,9 +1604,17 @@ sys/make-scheme [
 				'ssl-state none
 				'row-mode row-mode
 				'decode decode-mode
+				'connect-timeout connect-timeout
+				'query-timeout query-timeout
+				'application_name app-name
+				'search_path search-path
+				'trace? trace?
 			]
 			database: any [select params 'database database]
 			port/extra/database: database
+
+			; Optional: set logging verbosity from URL.
+			if integer? :log-level [system/options/log/postgres: log-level]
 
 			port/state: 'INIT
 
@@ -1484,9 +1633,20 @@ sys/make-scheme [
 			conn/awake: :pg-conn-awake
 			open conn
 			;; wait for the handshake...
-			unless port? wait [conn 10][
+			handshake-timeout: any [connect-timeout 10]
+			unless port? wait [conn handshake-timeout][
 				sys/log/error 'POSTGRES "Failed to connect!"
 			]
+
+			; Optional session initialization (after open succeeds).
+			if all [port/extra/options select port/extra/options 'search_path] [
+				; treat as part of open; errors should surface
+				sp: format-search-path select port/extra/options 'search_path
+				if sp [
+					write port ajoin ["SET search_path TO " sp ";"]
+				]
+			]
+
 			port
 		]
 
@@ -1510,7 +1670,7 @@ sys/make-scheme [
 		write: func [
 			port [port!]
 			data [string! word! block!]
-			/local ctx req on-row on-done on-complete on-error blk req-data max-rows arg6 arg7
+			/local ctx req on-row on-done on-complete on-error blk req-data max-rows arg6 arg7 timeout
 		][
 			unless open? port [
 				cause-error 'Access 'not-open port/spec/ref
@@ -1600,6 +1760,19 @@ sys/make-scheme [
 			reset-result-state ctx
 			queue-command ctx data
 
+			; TERMINATE closes the connection; server won't send ReadyForQuery.
+			if all [word? data data = 'TERMINATE] [
+				if all [
+					ctx/ReadyForQuery
+					port/state = 'READY
+				][
+					port/state: 'WRITE
+					write ctx/connection take/part ctx/out-buffer 32000
+				]
+				close port
+				return port
+			]
+
 			if all [
 				ctx/ReadyForQuery
 				port/state = 'READY
@@ -1607,7 +1780,11 @@ sys/make-scheme [
 				port/state: 'WRITE
 				write ctx/connection take/part ctx/out-buffer 32000
 			]
-			unless wait [port port/spec/timeout][
+			timeout: any [
+				all [ctx/options integer? select ctx/options 'query-timeout select ctx/options 'query-timeout]
+				port/spec/timeout
+			]
+			unless wait [port timeout][
 				;; wait returns none in case of timeout...
 				cause-error 'Access 'Timeout port/spec/ref
 			]

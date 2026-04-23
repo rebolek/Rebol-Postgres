@@ -203,6 +203,33 @@ foreach [title code] [
 		close pg2
 	]
 
+	"CancelRequest (G)" [
+		done: none
+		cb-ok: func [res][done: 'ok]
+		cb-err: func [err][done: err]
+		write pg [ASYNC "SELECT pg_sleep(10);" :cb-ok :cb-err]
+		; give the query a moment to start
+		wait 0:0:0.2
+		; cancel inflight query
+		unless pgsql/cancel pg [
+			cause-error 'Access 'Protocol reduce ['message "CancelRequest did not send"]
+		]
+		until [
+			wait [pg 15]
+			not none? done
+		]
+		if any [
+			done = 'ok
+			not map? done
+			; usually 57014 query_canceled
+			all [select done 'sql-state select done 'sql-state <> "57014"]
+		][
+			cause-error 'Access 'Protocol reduce ['message ajoin ["CancelRequest failed; done=" mold done]]
+		]
+		; connection should remain usable
+		write pg "SELECT 1 AS x"
+	]
+
 	"Creating test tables" [
 		write pg {
 BEGIN;

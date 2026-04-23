@@ -28,6 +28,20 @@ print res/command-tag
 close pg
 ```
 
+## Feature matrix (current)
+
+| Area | Support | Notes |
+|---|---|---|
+| Authentication | SCRAM, MD5, cleartext | Controlled by `auth=scram,md5,cleartext` allowlist. Cleartext is insecure unless used over TLS. |
+| TLS | `sslmode=disable|prefer|require` | `prefer` is downgradeable; use `require` on untrusted networks. No certificate verification knobs yet. |
+| Query protocol | Simple Query + Extended Query | Extended Query block forms: `EXEC`, `PREPARE/EXECUTE/DEALLOCATE`, `CURSOR/FETCH/CLOSE-CURSOR`. |
+| Results | rows + column metadata | `write` returns a `map!` with `rows`, `columns`, `command-tag`, `notices`, `runtime`, etc. |
+| Row shaping | `row=flat|block|map` | `flat` is legacy flattened output; `block` nests per-row; `map` keys by column name. |
+| Decoding | `decode=off|basic` (text format) | Basic scalar conversions (ints/bool/float/date). |
+| Async | queued per-connection | `write` block forms: `ASYNC`, `ASYNC-STREAM` (rows streaming + optional chunking). |
+| Notifications | LISTEN/NOTIFY | Handlers invoked from IO/awake context; keep handlers fast. |
+| Cancel | CancelRequest | `pgsql/cancel pg` cancels current inflight query when `BackendKeyData` is available. |
+
 ### Connection options (query params)
 
 You can pass a small set of options using URL query params:
@@ -36,6 +50,14 @@ You can pass a small set of options using URL query params:
 - `auth=<list>`: comma-separated list of allowed authentication methods: `scram,md5,cleartext`
 - `row=<mode>`: result row shaping: `flat` (default), `block`, `map`
 - `decode=<mode>`: type decoding: `off` (default), `basic` (text format only)
+- `application_name=<string>`: sets the Postgres `application_name` startup parameter
+- `search_path=<string>`: runs `SET search_path TO ...` after connecting (treated as part of `open`)
+  - Comma-separated schemas are supported (e.g. `public,extensions`)
+  - `$user` is supported as a special token
+- `connect-timeout=<seconds>`: handshake timeout (default: 10)
+- `query-timeout=<seconds>`: timeout for blocking `write` (default: port spec `timeout`)
+- `log=<int>`: sets `system/options/log/postgres` (scheme-wide)
+- `trace=1|true|on`: more verbose protocol logging (auth payloads are still redacted)
 - `sslmode=<mode>`: `disable` (default), `prefer`, `require`
   - `prefer` will try TLS and fall back to plaintext if the server refuses SSL.
   - `require` will error if the server refuses SSL.
@@ -148,6 +170,35 @@ until [wait [pg 10] got]
 close pg
 ```
 
+### CancelRequest
+
+If the server provided `BackendKeyData`, you can cancel the currently inflight query:
+
+```rebol
+pgsql: import %postgres.reb
+pg: open postgres://postgres:password@localhost/postgres
+
+done: none
+on-done: func [res][done: 'ok]
+on-err:  func [err][done: err]
+
+write pg [ASYNC "SELECT pg_sleep(10);" :on-done :on-err]
+wait 0:0:0.2
+pgsql/cancel pg
+
+until [wait [pg 15] done]
+close pg
+```
+
 ## Examples and tests
 
 For a fuller usage example (DDL/DML + error cases) see the test script: [`ci-test.r3`](ci-test.r3).
+
+## Known limitations & notes
+
+- **Single-connection concurrency**: Postgres protocol is sequential per connection; async calls are queued and resolved in order.
+- **TLS verification**: TLS is currently encryption-in-transit only; certificate/CA verification is not configurable yet.
+- **Logging**:
+  - `log=<int>` sets `system/options/log/postgres` (scheme-wide/global).
+  - Authentication payloads are redacted from logs; `trace` increases protocol verbosity but does not log secrets.
+- **Handler context**: async callbacks and NOTIFY handlers run from the port’s IO/awake processing; keep them fast and non-blocking.
