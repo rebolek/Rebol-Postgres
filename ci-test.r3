@@ -37,6 +37,12 @@ foreach [title code] [
 		write pg "SELECT 1::int4 AS i, 2::int8 AS b, true::bool AS t, 1.5::float8 AS f, '2023-10-26'::date AS d;"
 	]
 
+	"Extended query protocol demo (opt-in via PG_EXT=1)" [
+		if "1" = any [get-env "PG_EXT" "0"] [
+			write pg reduce ['EXEC "SELECT $1::int4 AS x, $2::text AS y" [123 "hello"]]
+		]
+	]
+
 	"Creating test tables" [
 		write pg {
 BEGIN;

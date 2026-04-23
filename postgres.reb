@@ -122,6 +122,99 @@ que-packet: function[
 	]
 ]
 
+make-cstring: func [
+	"Encode a Rebol string as a C-string (null-terminated)"
+	s [any-type!]
+][
+	join form any [s ""] null
+]
+
+make-parse-message: func [
+	"Build Parse message body"
+	stmt-name [any-type!]
+	query [string!]
+	param-oids [block! none!]
+	/local oids msg count
+][
+	oids: any [param-oids copy []]
+	msg: make binary! (64 + length? query)
+	binary/write msg [
+		BYTES :make-cstring stmt-name
+		BYTES :make-cstring query
+		UI16  length? oids
+	]
+	foreach oid oids [
+		binary/write msg [UI32 to integer! oid]
+	]
+	msg
+]
+
+encode-param-text: func [
+	"Encode a single parameter value to text bytes (or none for NULL)"
+	v [any-type!]
+][
+	case [
+		none? v [none]
+		logic? v [either v ["t"]["f"]]
+		'else [form v]
+	]
+]
+
+make-bind-message: func [
+	"Build Bind message body (text params, result format = text)"
+	portal-name [any-type!]
+	stmt-name [any-type!]
+	params [block!]
+	/local msg p enc
+][
+	msg: make binary! 128
+	binary/write msg [
+		BYTES :make-cstring portal-name
+		BYTES :make-cstring stmt-name
+		UI16  0                ; parameter format codes (0 = all text)
+		UI16  length? params   ; number of parameter values
+	]
+	foreach p params [
+		enc: encode-param-text p
+		either none? enc [
+			binary/write msg [SI32 -1]
+		][
+			enc: to binary! enc
+			binary/write msg [SI32 length? enc BYTES :enc]
+		]
+	]
+	binary/write msg [
+		UI16 0 ; result-column format codes (0 = all text)
+	]
+	msg
+]
+
+make-describe-message: func [
+	"Build Describe message body"
+	kind [char!]
+	name [any-type!]
+][
+	msg: make binary! 32
+	binary/write msg [
+		UI8   to integer! kind
+		BYTES :make-cstring name
+	]
+	msg
+]
+
+make-execute-message: func [
+	"Build Execute message body"
+	portal-name [any-type!]
+	max-rows [integer!]
+][
+	msg: make binary! 32
+	binary/write msg [
+		BYTES :make-cstring portal-name
+		UI32  max-rows
+	]
+	msg
+]
+
 error-fields: #[
 	;- https://www.postgresql.org/docs/current/protocol-error-fields.html
 	0#53 localized-severity   ;= S - the field contents are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE, DEBUG, INFO, or LOG (in a notice message), or a localized translation of one of these. Always present.
@@ -308,6 +401,27 @@ process-responses: function[
 				;@@ TODO: process the result!!!
 				ctx/CommandComplete: tmp: to string! binary/read bin len - 4
 				sys/log/more 'POSTGRES ["Command completed:^[[m" tmp]
+			]
+			#"1" [
+				;; ParseComplete (extended query protocol)
+				sys/log/more 'POSTGRES "ParseComplete"
+			]
+			#"2" [
+				;; BindComplete (extended query protocol)
+				sys/log/more 'POSTGRES "BindComplete"
+			]
+			#"3" [
+				;; CloseComplete (extended query protocol)
+				sys/log/more 'POSTGRES "CloseComplete"
+			]
+			#"n" [
+				;; NoData (e.g. Describe returned no rows)
+				sys/log/more 'POSTGRES "NoData"
+			]
+			#"s" [
+				;; PortalSuspended (Execute terminated due to row limit)
+				ctx/PortalSuspended?: true
+				sys/log/more 'POSTGRES "PortalSuspended"
 			]
 			#"E"
 			#"N" [
@@ -788,6 +902,7 @@ sys/make-scheme [
 				RowDescription: make block! 20
 				Data: make block! 1000
 				CommandComplete: none
+				PortalSuspended?: false
 				sasl: context [
 					;; input values...
 					user:     user
@@ -874,8 +989,8 @@ sys/make-scheme [
 
 		write: func [
 			port [port!]
-			data [string! word!]
-			/local ctx cols result rt
+			data [string! word! block!]
+			/local ctx cols result rt rows stmt sql params
 		][
 			unless open? port [
 				cause-error 'Access 'not-open port/spec/ref
@@ -885,6 +1000,7 @@ sys/make-scheme [
 			ctx/CommandComplete: none
 			ctx/last-error: none
 			ctx/last-result: none
+			ctx/PortalSuspended?: false
 			clear ctx/notices
 			clear ctx/Data
 			clear ctx/RowDescription
@@ -896,6 +1012,31 @@ sys/make-scheme [
 					switch data [
 						SYNC      [ que-packet ctx #"S" "" ]
 						TERMINATE [ que-packet ctx #"X" "Good bye!" ]
+					]
+				]
+				block? data [
+					switch/default first data [
+						EXEC [
+							unless string? second data [
+								ctx/error: make map! reduce ['message "EXEC expects SQL string as second item"]
+								cause-error 'Access 'Protocol ctx/error
+							]
+							sql: second data
+							params: any [third data copy []]
+							unless block? params [params: to block! params]
+							;-- Minimal extended query flow using unnamed statement/portal:
+							;   Parse + Bind + Describe(portal) + Execute + Sync
+							que-packet ctx #"P" make-parse-message "" sql none
+							que-packet ctx #"B" make-bind-message "" "" params
+							que-packet ctx #"D" make-describe-message #"P" ""
+							que-packet ctx #"E" make-execute-message "" 0
+							que-packet ctx #"S" ""
+						]
+					][
+						ctx/error: make map! reduce [
+							'message ajoin ["Unsupported write block form: " mold data]
+						]
+						cause-error 'Access 'Protocol ctx/error
 					]
 				]
 			]
