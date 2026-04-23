@@ -65,12 +65,27 @@ authenticate: funct [ctx] [
 		"n=" ctx/sasl/user ",r=" enbase nonce 64
 	]
 	msg: join ctx/sasl/gs2-header ctx/sasl/client-first-message-bare
+	mech: ajoin [any [ctx/sasl/mechanism "SCRAM-SHA-256"] null]
 	response: clear #{}
 	binary/write response [
-		BYTES     "SCRAM-SHA-256^@"
+		BYTES     :mech
 		UI32BYTES :msg
 	]
 	response
+]
+
+md5-password: func [
+	"Compute PostgreSQL MD5 auth response"
+	user     [string!]
+	password [string!]
+	salt     [binary!]
+][
+	inner: checksum ajoin [password user] 'md5
+	inner-hex: lowercase enbase inner 16
+	data: to binary! inner-hex
+	append data salt
+	outer: checksum data 'md5
+	rejoin ["md5" lowercase enbase outer 16]
 ]
 
 make-startup-message: funct [
@@ -162,6 +177,15 @@ process-responses: function[
 						;; Specifies that the authentication was successful.
 						ctx/authenticated?: true
 					]
+					3 [
+						;; AuthenticationCleartextPassword
+						que-packet ctx #"p" join ctx/sasl/password null
+					]
+					5 [
+						;; AuthenticationMD5Password
+						salt: binary/read bin 4
+						que-packet ctx #"p" join md5-password ctx/sasl/user ctx/sasl/password salt null
+					]
 					10 [
 						;; The message body is a list of SASL authentication mechanisms,
 						;; in the server's order of preference. A zero byte is required
@@ -170,12 +194,24 @@ process-responses: function[
 						until [
 							name: binary/read bin 'STRING
 							none? unless empty? name [
-								append tmp to word! name
+								append tmp name
 							]
 						]
-						;; pg/state: 'AuthenticationSASL
-						sys/log/debug 'POSTGRES "Writing authenticate"
-						que-packet ctx #"p" authenticate ctx
+						;; Choose a supported mechanism from the offered list.
+						case [
+							find tmp "SCRAM-SHA-256" [
+								ctx/sasl/mechanism: "SCRAM-SHA-256"
+								sys/log/debug 'POSTGRES ["Using SASL mechanism:" ctx/sasl/mechanism]
+								que-packet ctx #"p" authenticate ctx
+							]
+							'else [
+								ctx/error: make map! reduce [
+									'message ajoin ["Unsupported SASL mechanisms: " mold tmp]
+								]
+								sys/log/error 'POSTGRES select ctx/error 'message
+								break
+							]
+						]
 					]
 					11 [
 						;; Complete server response is used in the authentication exchange!
@@ -481,6 +517,7 @@ sys/make-scheme [
 					;; input values...
 					user:     user
 					password: any [select spec 'pass "postgres"]
+					mechanism: none
 					mechanisms: copy []
 					salt: none
 					iterations: 4096
